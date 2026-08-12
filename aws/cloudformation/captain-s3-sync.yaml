@@ -1,0 +1,479 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# Template version (date-based, YYYY-MM-DD). Bump this when the template shape
+# changes and re-host it under a matching dated path, e.g.
+#   .../templates/2026-08-12/captain-s3-sync.yaml
+# Customer-facing object ids in this template are Stripe-style prefix_token
+# (dep_..., sync_...), never bare UUIDs.
+Metadata:
+  Captain:
+    TemplateVersion: "2026-08-12"
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Captain enrollment (pre-filled by Captain, confirm before launch)" }
+        Parameters: [CaptainCallbackUrl, CaptainAccountId, SyncId, ExternalId, Secret]
+      - Label: { default: "Your bucket" }
+        Parameters: [BucketName]
+    ParameterLabels:
+      CaptainCallbackUrl: { default: "Captain callback URL" }
+      CaptainAccountId: { default: "Captain AWS account id" }
+      SyncId: { default: "Captain sync id" }
+      ExternalId: { default: "External id (confused-deputy guard)" }
+      Secret: { default: "Enrollment secret (write-only)" }
+      BucketName: { default: "S3 bucket to sync" }
+
+Description: >
+  Captain S3 one-click sync (self-verifying). Stands up the cross-account plumbing
+  Captain needs to keep an S3 collection synced near-real-time, entirely inside the
+  CUSTOMER'S AWS account: an SNS topic fed by the bucket's ObjectCreated/ObjectRemoved
+  events, a read-only cross-account IAM role Captain assumes (no long-lived keys), and
+  a self-verifying custom resource that phones home to Captain so enrollment either
+  completes and is confirmed, or fails visibly in Stack Events and rolls back.
+
+# ---------------------------------------------------------------------------
+# DEBUGGABLE-DEPLOY DESIGN (read this before editing)
+#
+# The problem with "click Launch Stack and hope": if anything is misconfigured
+# (wrong account id, an SNS policy that blocks S3, a role Captain cannot assume),
+# the customer gets a green CloudFormation stack and a sync that silently never
+# works. There is no feedback loop.
+#
+# This template closes the loop with a PHONE-HOME custom resource:
+#
+#   1. CloudFormation creates the SNS topic, the topic policy, and the read role.
+#   2. The bucket's notification config is pointed at the topic (see the
+#      BUCKET NOTIFICATION CONSTRAINT block below for why this is a custom
+#      resource and not a native property on a pre-existing bucket).
+#   3. The EnrollWithCaptain custom resource POSTs every fact Captain needs
+#      (stackId, region, bucket, snsTopicArn, roleArn, externalId, syncId,
+#      secret, deploymentId) to CaptainCallbackUrl. Captain then:
+#        - subscribes its own endpoint to the SNS topic,
+#        - assumes the read role with the external id (proving the trust +
+#          policy actually work),
+#        - runs a verification handshake, and
+#        - returns 2xx only if all of that succeeded.
+#   4. If the callback is non-2xx, times out, or errors, the custom resource
+#      sends FAILED to CloudFormation with a human-readable Reason. That turns
+#      into a red line in Stack Events and rolls the stack back. The customer
+#      sees the failure at deploy time, not three days later when documents
+#      are stale.
+#
+# So the deploy is self-verifying: a SUCCEEDED stack means Captain has
+# confirmed, end to end, that it can both receive events and read objects.
+# ---------------------------------------------------------------------------
+
+Parameters:
+
+  CaptainCallbackUrl:
+    Type: String
+    # PLACEHOLDER: confirm this is the live Captain prod enroll endpoint before
+    # publishing the hosted template. Captain normally pre-fills it per-sync.
+    Default: "https://api.runcaptain.com/v1/deploy/aws/s3/enroll"
+    AllowedPattern: "^https://.*"
+    ConstraintDescription: Must be an https:// URL (the custom resource refuses to send the secret over plaintext).
+    Description: >
+      Captain enrollment endpoint the phone-home custom resource POSTs to on
+      create/update/delete. PLACEHOLDER default shown; Captain fills this in when
+      it generates your Launch Stack link. Must be https.
+
+  CaptainAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    ConstraintDescription: Must be a 12-digit AWS account id.
+    Description: >
+      Captain's AWS account id. The cross-account read role trusts this principal
+      (scoped further by ExternalId). Captain fills this in.
+
+  ExternalId:
+    Type: String
+    MinLength: 8
+    MaxLength: 1224
+    Description: >
+      Per-sync external id. Captain must present it when assuming the read role,
+      which blocks the confused-deputy problem (another Captain tenant cannot
+      trick Captain into assuming your role). Captain fills this in.
+
+  BucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9.\\-]{3,63}$"
+    ConstraintDescription: Must be a valid S3 bucket name (3-63 chars, lowercase).
+    Description: The EXISTING S3 bucket to sync. This template does not create it.
+
+  SyncId:
+    Type: String
+    AllowedPattern: "^sync_[A-Za-z0-9]+$"
+    ConstraintDescription: Must be a Captain sync id of the form sync_<token>.
+    Description: The Captain sync id (sync_<token>) this deployment enrolls. Captain fills this in.
+
+  Secret:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: >
+      One-time enrollment secret minted by Captain for this sync. Sent to
+      CaptainCallbackUrl so Captain can bind this deployment to your sync. Write-only
+      (NoEcho); never surfaced in Outputs or logs.
+
+Resources:
+
+  # =========================================================================
+  # 1. EVENT WIRING: SNS topic + topic policy + bucket notification
+  # =========================================================================
+
+  # The topic Captain subscribes to. S3 publishes object-change events here; the
+  # phone-home hands Captain this topic's ARN so it can subscribe its endpoint.
+  CaptainSyncTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "captain-s3-sync-${SyncId}"
+      DisplayName: !Sub "Captain S3 sync for ${BucketName}"
+      Tags:
+        - { Key: captain:sync-id, Value: !Ref SyncId }
+        - { Key: captain:managed-by, Value: cloudformation }
+
+  # Topic policy: (a) let THIS bucket publish (SourceArn + SourceAccount pin it
+  # so no other account's bucket can publish), and (b) let Captain's account
+  # subscribe its endpoint to the topic (so Captain, not just the console user,
+  # can complete the subscription during the handshake).
+  CaptainSyncTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref CaptainSyncTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowThisBucketToPublish
+            Effect: Allow
+            Principal: { Service: s3.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref CaptainSyncTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowCaptainToSubscribe
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${CaptainAccountId}:root"
+            Action:
+              - sns:Subscribe
+              - sns:GetTopicAttributes
+            Resource: !Ref CaptainSyncTopic
+
+  # -------------------------------------------------------------------------
+  # BUCKET NOTIFICATION CONSTRAINT (be honest about this):
+  #
+  # CloudFormation can only set a bucket's NotificationConfiguration natively
+  # (via AWS::S3::Bucket) on a bucket THIS stack creates and owns. The bucket
+  # here already exists and is not managed by this stack, so we cannot attach a
+  # native notification property to it.
+  #
+  # A bucket also has exactly ONE notification configuration. A naive
+  # PutBucketNotificationConfiguration REPLACES it wholesale and would silently
+  # wipe any SNS/SQS/Lambda/EventBridge hooks the customer already has.
+  #
+  # So we set the notification through a custom resource that does an ADDITIVE
+  # read-merge-write: GET the existing config, APPEND our TopicConfiguration
+  # (tagged with our sync id), PUT the merged result. On delete it removes only
+  # OUR topic config and leaves every sibling hook untouched. If you would
+  # rather not grant the notification-management permission, delete this custom
+  # resource and its role and run the documented manual step in the README
+  # instead; everything else in the stack still stands up.
+  # -------------------------------------------------------------------------
+
+  SetBucketNotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "captain-s3-setnotif-${SyncId}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: manage-this-bucket-notification
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+
+  SetBucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "captain-s3-setnotif-${SyncId}"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt SetBucketNotificationRole.Arn
+      Code:
+        ZipFile: |
+          # Additively point an EXISTING bucket's notifications at our SNS topic
+          # WITHOUT clobbering any hooks the customer already has, and always
+          # answer CloudFormation so the stack never hangs for an hour.
+          import json, urllib.request, boto3
+
+          s3 = boto3.client("s3")
+          SID = "CaptainSyncTopic"  # marker so we can find + remove only our config
+
+          def send(evt, ctx, status, reason, pid=None):
+              body = json.dumps({
+                  "Status": status, "Reason": reason[:1024],
+                  "PhysicalResourceId": pid or ctx.log_stream_name,
+                  "StackId": evt["StackId"], "RequestId": evt["RequestId"],
+                  "LogicalResourceId": evt["LogicalResourceId"], "Data": {},
+              }).encode()
+              req = urllib.request.Request(
+                  evt["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req, timeout=30)
+
+          def handler(evt, ctx):
+              rtype = evt.get("RequestType")
+              props = evt.get("ResourceProperties", {})
+              bucket = props.get("BucketName")
+              topic = props.get("TopicArn")
+              try:
+                  cfg = s3.get_bucket_notification_configuration(Bucket=bucket)
+                  cfg.pop("ResponseMetadata", None)
+                  topics = [t for t in cfg.get("TopicConfigurations", [])
+                            if t.get("Id") != SID]  # drop any prior copy of ours
+                  if rtype in ("Create", "Update"):
+                      topics.append({
+                          "Id": SID,
+                          "TopicArn": topic,
+                          "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+                      })
+                  # On Delete we simply do not re-add ours -> it is removed.
+                  if topics:
+                      cfg["TopicConfigurations"] = topics
+                  else:
+                      cfg.pop("TopicConfigurations", None)
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket, NotificationConfiguration=cfg)
+                  send(evt, ctx, "SUCCESS", "notification config updated")
+              except Exception as e:
+                  # On Delete, never wedge the stack on a teardown error.
+                  if rtype == "Delete":
+                      send(evt, ctx, "SUCCESS", "delete tolerated error: %s" % e)
+                  else:
+                      send(evt, ctx, "FAILED", "set notification failed: %s" % e)
+
+  SetBucketNotification:
+    Type: Custom::SetBucketNotification
+    # Depend on the topic policy: S3 rejects PutBucketNotification unless the
+    # topic already grants it sns:Publish, so the policy must exist first.
+    DependsOn: CaptainSyncTopicPolicy
+    Properties:
+      ServiceToken: !GetAtt SetBucketNotificationFunction.Arn
+      BucketName: !Ref BucketName
+      TopicArn: !Ref CaptainSyncTopic
+
+  # =========================================================================
+  # 2. CROSS-ACCOUNT READ ROLE (the assume_role path, no long-lived keys)
+  # =========================================================================
+
+  # Captain assumes this role to LIST and GET objects during reconcile. Trust is
+  # limited to Captain's account AND gated by the external id (confused-deputy
+  # protection). Permissions are limited to read on exactly this one bucket.
+  CaptainReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "captain-s3-read-${SyncId}"
+      Description: !Sub "Read-only access to ${BucketName} for Captain sync ${SyncId}."
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${CaptainAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      Policies:
+        - PolicyName: read-this-bucket-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListThisBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+              - Sid: GetObjectsInThisBucket
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}/*"
+      Tags:
+        - { Key: captain:sync-id, Value: !Ref SyncId }
+        - { Key: captain:managed-by, Value: cloudformation }
+
+  # =========================================================================
+  # 3. SELF-VERIFYING CUSTOM RESOURCE (phone home + handshake)
+  # =========================================================================
+
+  EnrollFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "captain-s3-enroll-${SyncId}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      # No extra permissions: this function only makes an outbound HTTPS call to
+      # Captain and answers CloudFormation. It touches no AWS resources.
+
+  EnrollFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "captain-s3-enroll-${SyncId}"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 180
+      Role: !GetAtt EnrollFunctionRole.Arn
+      Code:
+        ZipFile: |
+          # Phone-home custom resource. POSTs the enrollment facts to Captain and
+          # ALWAYS answers CloudFormation, so a failed handshake shows up in Stack
+          # Events and rolls the stack back instead of hanging for an hour.
+          import json, secrets, string, urllib.request, urllib.error
+
+          ALPHABET = string.ascii_letters + string.digits
+
+          def new_deployment_id():
+              # Stripe-style dep_<token>, no bare UUIDs in customer-facing output.
+              return "dep_" + "".join(secrets.choice(ALPHABET) for _ in range(24))
+
+          def cfn_respond(evt, ctx, status, reason, data):
+              body = json.dumps({
+                  "Status": status, "Reason": reason[:1024],
+                  "PhysicalResourceId": data.get("deploymentId") or ctx.log_stream_name,
+                  "StackId": evt["StackId"], "RequestId": evt["RequestId"],
+                  "LogicalResourceId": evt["LogicalResourceId"], "Data": data,
+              }).encode()
+              req = urllib.request.Request(
+                  evt["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req, timeout=30)
+
+          def phone_home(url, payload):
+              data = json.dumps(payload).encode()
+              req = urllib.request.Request(
+                  url, data=data, method="POST",
+                  headers={"content-type": "application/json",
+                           "user-agent": "captain-cfn-enroll/2026-08-12"})
+              # Raises on non-2xx (HTTPError) or timeout/DNS (URLError); caller
+              # converts either into a CloudFormation FAILED with a clear reason.
+              with urllib.request.urlopen(req, timeout=45) as resp:
+                  raw = resp.read().decode("utf-8", "replace")
+                  try:
+                      return resp.status, json.loads(raw)
+                  except Exception:
+                      return resp.status, {"raw": raw[:512]}
+
+          def handler(evt, ctx):
+              rtype = evt.get("RequestType")
+              props = evt.get("ResourceProperties", {})
+              # Reuse the deployment id across UPDATE/DELETE (it is the physical id).
+              dep_id = evt.get("PhysicalResourceId") or new_deployment_id()
+              if not dep_id.startswith("dep_"):
+                  dep_id = new_deployment_id()
+              base = {
+                  "deploymentId": dep_id,
+                  "templateVersion": "2026-08-12",
+                  "action": rtype.lower(),
+                  "stackId": evt.get("StackId"),
+                  "region": props.get("Region"),
+                  "bucket": props.get("BucketName"),
+                  "snsTopicArn": props.get("SnsTopicArn"),
+                  "roleArn": props.get("RoleArn"),
+                  "externalId": props.get("ExternalId"),
+                  "syncId": props.get("SyncId"),
+                  "secret": props.get("Secret"),
+              }
+              url = props.get("CaptainCallbackUrl")
+              try:
+                  if rtype == "Delete":
+                      # Best-effort teardown notice; never block a stack delete on it.
+                      try:
+                          phone_home(url, {**base, "action": "delete"})
+                      except Exception as e:
+                          print("teardown notice failed (tolerated): %s" % e)
+                      cfn_respond(evt, ctx, "SUCCESS",
+                                  "teardown notice sent", {"deploymentId": dep_id})
+                      return
+                  # Create / Update: the handshake MUST succeed or we fail visibly.
+                  status, resp = phone_home(url, base)
+                  ok = isinstance(resp, dict) and resp.get("verified") is True
+                  if 200 <= status < 300 and ok:
+                      cfn_respond(evt, ctx, "SUCCESS",
+                                  "Captain verified enrollment",
+                                  {"deploymentId": dep_id,
+                                   "captainStatus": resp.get("status", "verified")})
+                  else:
+                      reason = ("Captain did not confirm enrollment "
+                                "(http %s, verified=%s). Response: %s"
+                                % (status, ok, json.dumps(resp)[:400]))
+                      cfn_respond(evt, ctx, "FAILED", reason, {"deploymentId": dep_id})
+              except urllib.error.HTTPError as e:
+                  detail = e.read().decode("utf-8", "replace")[:400] if hasattr(e, "read") else ""
+                  cfn_respond(evt, ctx, "FAILED",
+                              "Captain callback returned HTTP %s: %s" % (e.code, detail),
+                              {"deploymentId": dep_id})
+              except Exception as e:
+                  # Timeout, DNS failure, bad URL: fail the deploy with the reason.
+                  cfn_respond(evt, ctx, "FAILED",
+                              "Could not reach Captain callback: %s" % e,
+                              {"deploymentId": dep_id})
+
+  # Run the phone-home LAST: only enroll once the topic, policy, notification, and
+  # read role all exist, so Captain's handshake tests real, finished plumbing.
+  EnrollWithCaptain:
+    Type: Custom::EnrollWithCaptain
+    # RoleArn below is a GetAtt on CaptainReadRole, so that dependency is already
+    # implicit; we only need to name the resources this one does NOT reference.
+    DependsOn:
+      - CaptainSyncTopicPolicy
+      - SetBucketNotification
+    Properties:
+      ServiceToken: !GetAtt EnrollFunction.Arn
+      CaptainCallbackUrl: !Ref CaptainCallbackUrl
+      Region: !Ref AWS::Region
+      BucketName: !Ref BucketName
+      SnsTopicArn: !Ref CaptainSyncTopic
+      RoleArn: !GetAtt CaptainReadRole.Arn
+      ExternalId: !Ref ExternalId
+      SyncId: !Ref SyncId
+      Secret: !Ref Secret
+
+Outputs:
+  SnsTopicArn:
+    Description: SNS topic the bucket publishes change events to; Captain subscribes here.
+    Value: !Ref CaptainSyncTopic
+  ReadRoleArn:
+    Description: Cross-account read-only role Captain assumes (with the external id).
+    Value: !GetAtt CaptainReadRole.Arn
+  ExternalId:
+    Description: External id Captain must present when assuming the read role.
+    Value: !Ref ExternalId
+  DeploymentId:
+    Description: Stripe-style deployment id (dep_<token>) generated during the phone-home.
+    Value: !GetAtt EnrollWithCaptain.deploymentId
+  WhatToDoNext:
+    Description: One-line next step.
+    Value: !Sub >-
+      Deployment ${EnrollWithCaptain.deploymentId} is enrolled and verified. Open your
+      Captain dashboard for sync ${SyncId}; a targeted reconcile of ${BucketName} runs
+      automatically and future object changes sync near-real-time.
