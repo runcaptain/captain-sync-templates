@@ -11,17 +11,6 @@ variable "sync_id" {
   }
 }
 
-variable "secret" {
-  type        = string
-  sensitive   = true
-  description = "One-time enrollment secret Captain minted for this sync (>= 16 chars). Sent to Captain over TLS only; never stored anywhere it can be read back."
-
-  validation {
-    condition     = length(var.secret) >= 16
-    error_message = "secret must be at least 16 characters."
-  }
-}
-
 variable "bucket_name" {
   type        = string
   description = "EXISTING Backblaze B2 bucket to sync. This module does not create it."
@@ -32,25 +21,18 @@ variable "bucket_name" {
   }
 }
 
-variable "callback_url" {
+# The Captain API key is NOT a variable on purpose: export CAPTAIN_API_KEY in
+# the environment. enroll_webhook.sh reads it from there, so it never lands in
+# terraform.tfvars, the plan, or state.
+
+variable "api_base" {
   type        = string
-  default     = "https://api.runcaptain.com/v1/deploy/b2/enroll"
-  description = "Captain enroll endpoint the phone-home POSTs to. Must be https. PLACEHOLDER default; Captain fills this in per-sync."
+  default     = "https://api.captain.dev"
+  description = "Captain API base the webhook enrollment call targets. Must be https. Override only if Captain support points you at another environment, for example staging."
 
   validation {
-    condition     = can(regex("^https://", var.callback_url))
-    error_message = "callback_url must be an https:// URL (the secret is only ever sent over TLS)."
-  }
-}
-
-variable "events_url" {
-  type        = string
-  default     = ""
-  description = "Captain ingest webhook the B2 notification rule points at. Must be https. Defaults to the enroll host's /events path tagged with the sync id when left blank."
-
-  validation {
-    condition     = var.events_url == "" || can(regex("^https://", var.events_url))
-    error_message = "events_url must be blank or an https:// URL."
+    condition     = can(regex("^https://", var.api_base))
+    error_message = "api_base must be an https:// URL (the API key is only ever sent over TLS)."
   }
 }
 

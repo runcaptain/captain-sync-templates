@@ -1,11 +1,12 @@
 # Terraform / OpenTofu version and provider pins for the Captain R2 sync stack.
 # Validated with `tofu validate` (OpenTofu 1.12) against cloudflare provider 5.x.
 #
-# STATE CONTAINS SECRETS. This stack's state holds the Captain enrollment
-# secret (var.captain_secret, written into the Worker's CAPTAIN_SECRET) and
-# the derived R2 read credentials (cloudflare_api_token.read's id and the
-# SHA-256 secret computed from its value) IN PLAINTEXT. Terraform state is
-# not encrypted at rest by default. You MUST point this stack at an encrypted
+# STATE CONTAINS SECRETS. This stack's state holds the Worker's shared
+# read-proxy secret (var.captain_secret, written into the Worker's
+# CAPTAIN_SECRET), the Captain API key (var.captain_api_key, recorded inside
+# data.http.subscribe's request headers), and the derived R2 read credentials
+# (cloudflare_api_token.read's id and the SHA-256 secret computed from its
+# value) IN PLAINTEXT. Terraform state is not encrypted at rest by default. You MUST point this stack at an encrypted
 # remote backend before running it against anything real, for example:
 #
 #   terraform {

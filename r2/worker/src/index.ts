@@ -16,13 +16,16 @@
 //      bucket binding lives on the Worker; Captain never gets a standing key.
 //      Auth is a bearer secret shared only between Captain and this Worker.
 //
-//   3. SELF-TEST + PHONE-HOME (self-verifying deploy)
-//      /__captain/enroll POSTs the deployment facts to Captain and returns
-//      Captain's verified verdict; the deploy script fails loudly if Captain does
-//      not confirm. /__captain/selftest writes and deletes a canary object to
-//      prove the R2 -> Queue -> Worker -> Captain event path actually delivers
+//   3. SELF-TEST
+//      /__captain/selftest writes and deletes a canary object to prove the
+//      R2 -> Queue -> Worker -> Captain event path actually delivers
 //      (R2 event notifications have historically delivered zero events in some
 //      accounts, so this probe is the honest way to check before trusting them).
+//
+// ENROLLMENT lives in ../deploy.sh, not in this Worker: the deploy script calls
+// POST {CAPTAIN_API_BASE}/v2/syncs/{SYNC_ID}/webhooks with the Captain API key
+// and Captain mints the subscribe_url this Worker forwards events to
+// (CAPTAIN_INGEST_URL below).
 //
 // RECONCILE/POLLING IS THE ALWAYS-ON BACKSTOP. Webhooks (the Queue path) are the
 // latency optimization. If the Queue path is silent, scheduled reconcile through
@@ -41,12 +44,17 @@ export interface Env {
   BUCKET_NAME: string; // the R2 bucket this sync watches
   ACCOUNT_ID: string; // Cloudflare account id
   TEMPLATE_VERSION: string; // date-based, YYYY-MM-DD
-  CAPTAIN_INGEST_URL: string; // where queue events are POSTed
-  CAPTAIN_ENROLL_URL: string; // phone-home enroll endpoint
+  // The per-sync subscribe_url Captain minted when deploy.sh called
+  // POST {CAPTAIN_API_BASE}/v2/syncs/{SYNC_ID}/webhooks. Queue events are
+  // POSTed here. There is no default: deploy.sh fills it in from Captain's
+  // response, and the queue consumer refuses to run without it.
+  CAPTAIN_INGEST_URL: string;
   DEBUG?: string; // "true" turns on verbose logging
 
   // --- Secret (set via `wrangler secret put CAPTAIN_SECRET`) ---
-  CAPTAIN_SECRET: string; // bearer auth, both directions
+  // Customer-chosen shared secret that authenticates the /__captain/* read
+  // proxy and self-test routes. Also attached as a bearer on forwarded events.
+  CAPTAIN_SECRET: string;
 }
 
 // Shape of an R2 event-notification message as delivered to the Queue.
@@ -124,16 +132,6 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
-// Stripe-style id, dep_<token>. No bare UUIDs anywhere in customer-facing output.
-function newDeploymentId(): string {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  const bytes = new Uint8Array(24);
-  crypto.getRandomValues(bytes);
-  let token = "";
-  for (const b of bytes) token += alphabet[b % alphabet.length];
-  return "dep_" + token;
-}
-
 // =============================================================================
 // QUEUE CONSUMER: R2 event notifications -> Captain ingest
 // =============================================================================
@@ -161,6 +159,14 @@ async function handleQueue(batch: MessageBatch<R2EventBody>, env: Env): Promise<
 
   if (events.length === 0) {
     log(env, "info", "no forwardable events in batch");
+    return;
+  }
+
+  if (!env.CAPTAIN_INGEST_URL) {
+    // Misconfigured deploy: no subscribe_url was baked in. Retry so the batch
+    // survives until the config is fixed; reconcile covers the gap either way.
+    log(env, "error", "CAPTAIN_INGEST_URL is not set; re-run deploy.sh so Captain's subscribe_url gets baked into the Worker config. Retrying batch.");
+    batch.retryAll({ delaySeconds: 30 });
     return;
   }
 
@@ -205,7 +211,7 @@ async function handleQueue(batch: MessageBatch<R2EventBody>, env: Env): Promise<
 }
 
 // =============================================================================
-// HTTP: health, read proxy, enroll, self-test
+// HTTP: health, read proxy, self-test
 // =============================================================================
 async function handleFetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(req.url);
@@ -221,7 +227,6 @@ async function handleFetch(req: Request, env: Env, ctx: ExecutionContext): Promi
       account: env.ACCOUNT_ID,
       config: {
         ingestUrl: Boolean(env.CAPTAIN_INGEST_URL),
-        enrollUrl: Boolean(env.CAPTAIN_ENROLL_URL),
         secret: Boolean(env.CAPTAIN_SECRET),
         r2Binding: Boolean(env.R2),
         debug: env.DEBUG === "true",
@@ -282,51 +287,6 @@ async function handleFetch(req: Request, env: Env, ctx: ExecutionContext): Promi
     } catch (err) {
       log(env, "error", "get failed", { key, error: String(err) });
       return json({ error: "get_failed", key, detail: String(err) }, 502);
-    }
-  }
-
-  // ---- PHONE-HOME: enroll with Captain and return the verdict ----
-  if (path === "/__captain/enroll" && req.method === "POST") {
-    const deploymentId = url.searchParams.get("deploymentId") || newDeploymentId();
-    const payload = {
-      deploymentId,
-      templateVersion: env.TEMPLATE_VERSION,
-      action: "create",
-      source: "r2",
-      accountId: env.ACCOUNT_ID,
-      bucket: env.BUCKET_NAME,
-      syncId: env.SYNC_ID,
-      workerUrl: url.origin,
-      readStrategy: "worker-proxy",
-      ingestUrl: env.CAPTAIN_INGEST_URL,
-      secret: env.CAPTAIN_SECRET,
-    };
-    try {
-      const resp = await fetch(env.CAPTAIN_ENROLL_URL, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "user-agent": `captain-r2-worker/${env.TEMPLATE_VERSION}`,
-        },
-        body: JSON.stringify(payload),
-      });
-      const text = await resp.text();
-      let parsed: Record<string, unknown> = {};
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = { raw: text.slice(0, 500) };
-      }
-      const verified = resp.ok && parsed.verified === true;
-      log(env, verified ? "info" : "error", "enroll handshake complete", {
-        deploymentId,
-        status: resp.status,
-        verified,
-      });
-      return json({ deploymentId, verified, captainStatus: resp.status, captain: parsed }, verified ? 200 : 502);
-    } catch (err) {
-      log(env, "error", "enroll handshake failed to reach Captain", { deploymentId, error: String(err) });
-      return json({ deploymentId, verified: false, error: "enroll_unreachable", detail: String(err) }, 502);
     }
   }
 

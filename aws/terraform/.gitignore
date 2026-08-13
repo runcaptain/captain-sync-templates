@@ -4,7 +4,7 @@
 *.tfstate
 *.tfstate.*
 crash.log
-# Filled-in vars carry the one-time secret. Only the .example is committed.
+# Filled-in vars carry the Captain API key. Only the .example is committed.
 terraform.tfvars
 *.auto.tfvars
 # Python bytecode from zipping the Lambda sources.

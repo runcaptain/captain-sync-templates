@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Reverse setup.sh: remove the notification, subscription, topic, push SA, and
-# the reader binding, then send Captain a best-effort teardown notice. Safe to
-# run more than once (missing resources are skipped, not errors).
+# the reader binding. Safe to run more than once (missing resources are
+# skipped, not errors).
+#
+# There is no teardown call to the Captain API: no unsubscribe endpoint is
+# documented, and none is needed. Once the cloud-side resources are gone,
+# Captain detects the dead event source and the reconcile backstop keeps the
+# sync consistent. Remove the sync itself in your Captain dashboard if you no
+# longer want it.
 #
 # Usage:
 #   ./teardown.sh --project P --bucket B --sync-id sync_x \
-#     --secret <the enrollment secret Captain minted for this sync> \
 #     --reader-sa captain-reader@captain-prod.iam.gserviceaccount.com \
-#     [--push-sa cap-push-xxx@P.iam.gserviceaccount.com] \
-#     [--deployment-id dep_...] [--external-id ...] \
-#     [--enroll-url https://api.runcaptain.com/v1/deploy/gcp/gcs/enroll] [--dry-run]
+#     [--push-sa cap-push-xxx@P.iam.gserviceaccount.com] [--dry-run]
 #
 # --push-sa is optional: setup.sh derives the push SA id deterministically
 # from --sync-id, so teardown.sh derives the same id when --push-sa is
 # omitted rather than requiring the caller to remember it.
 # =============================================================================
 set -euo pipefail
-
-TEMPLATE_VERSION="2026-08-12"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENROLL_SH="${HERE}/../terraform/enroll.sh"
 
 log()  { printf '[captain-teardown %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
 step() { printf '\n[captain-teardown %s] ==== %s ====\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
@@ -41,9 +40,7 @@ sha256_hex() {
 push_sa_id_for_sync() { printf 'cap-push-%s' "$(sha256_hex "$1" | cut -c1-16)"; }
 
 PROJECT_ID=""; BUCKET_NAME=""; SYNC_ID=""; PUSH_SA_EMAIL=""; CAPTAIN_READER_SA=""
-DEPLOYMENT_ID=""; EXTERNAL_ID="teardown-noop"; ENROLLMENT_SECRET=""; DRY_RUN="0"
-CAPTAIN_ENROLL_URL="https://api.runcaptain.com/v1/deploy/gcp/gcs/enroll"
-CAPTAIN_INGEST_URL="https://api.runcaptain.com/v1/deploy/gcp/gcs/ingest"
+DRY_RUN="0"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,10 +49,6 @@ while [ $# -gt 0 ]; do
     --sync-id)       SYNC_ID="$2"; shift 2 ;;
     --push-sa)       PUSH_SA_EMAIL="$2"; shift 2 ;;
     --reader-sa)     CAPTAIN_READER_SA="$2"; shift 2 ;;
-    --deployment-id) DEPLOYMENT_ID="$2"; shift 2 ;;
-    --external-id)   EXTERNAL_ID="$2"; shift 2 ;;
-    --secret)        ENROLLMENT_SECRET="$2"; shift 2 ;;
-    --enroll-url)    CAPTAIN_ENROLL_URL="$2"; shift 2 ;;
     --dry-run)       DRY_RUN="1"; shift ;;
     -h|--help)       grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument: $1" ;;
@@ -69,8 +62,6 @@ done
 : "${PROJECT_ID:?--project is required}"
 : "${BUCKET_NAME:?--bucket is required}"
 : "${SYNC_ID:?--sync-id is required}"
-[ -z "$ENROLLMENT_SECRET" ] || [ "${#ENROLLMENT_SECRET}" -ge 16 ] \
-  || die "--secret must be at least 16 characters (it is the same enrollment secret setup.sh used)."
 
 # Derive the push SA id the same way setup.sh does, unless the caller already
 # knows a different one. Keeps teardown effective even when --push-sa is
@@ -79,8 +70,6 @@ done
 
 TOPIC="captain-gcs-sync-${SYNC_ID}"
 SUB="captain-gcs-push-${SYNC_ID}"
-TOPIC_FQN="projects/${PROJECT_ID}/topics/${TOPIC}"
-SUB_FQN="projects/${PROJECT_ID}/subscriptions/${SUB}"
 
 TEARDOWN_HAD_FAILURE=0
 # already_gone: case-insensitive match on the handful of phrases GCP uses for
@@ -159,30 +148,6 @@ else
   log "no --reader-sa given; skipping binding removal"
 fi
 
-step "Best-effort teardown notice to Captain"
-# Authenticated the same way the Terraform destroy path is: the real
-# enrollment secret, not a placeholder. enroll.sh treats create and delete
-# identically here (it only relaxes the RESPONSE requirements for delete), so
-# a fake secret would either be silently accepted by a lenient backend (a
-# spoofable teardown notice) or rejected outright -- neither is the contract
-# Terraform's destroy path uses. Skip the notice rather than send either.
-if [ "$DRY_RUN" = "1" ]; then
-  log "dry-run: skipping teardown notice"
-elif [ -z "$ENROLLMENT_SECRET" ]; then
-  log "no --secret given; skipping teardown notice rather than send it unauthenticated (Captain reconciles orphans)."
-elif [ -f "$ENROLL_SH" ] && [ -n "$DEPLOYMENT_ID" ]; then
-  CAPTAIN_ENROLL_URL="$CAPTAIN_ENROLL_URL" ACTION="delete" \
-  DEPLOYMENT_ID="$DEPLOYMENT_ID" TEMPLATE_VERSION="$TEMPLATE_VERSION" \
-  SYNC_ID="$SYNC_ID" EXTERNAL_ID="$EXTERNAL_ID" PROJECT_ID="$PROJECT_ID" \
-  BUCKET_NAME="$BUCKET_NAME" PUBSUB_TOPIC="$TOPIC_FQN" PUBSUB_SUBSCRIPTION="$SUB_FQN" \
-  PUSH_SERVICE_ACCOUNT="${PUSH_SA_EMAIL:-none}" READER_SERVICE_ACCOUNT="${CAPTAIN_READER_SA:-none}" \
-  INGEST_URL="$CAPTAIN_INGEST_URL" OIDC_AUDIENCE="$CAPTAIN_INGEST_URL" \
-  ENROLLMENT_SECRET="$ENROLLMENT_SECRET" \
-    bash "$ENROLL_SH" delete || log "teardown notice failed; tolerated (Captain reconciles orphans)."
-else
-  log "no --deployment-id or enroll.sh missing; skipping notice (Captain reconciles orphans)."
-fi
-
 # Check TEARDOWN_HAD_FAILURE before the --dry-run early return: a dry run
 # still makes real read calls (e.g. the notification list above), and a
 # genuine failure there (permission denied, wrong bucket, transient API
@@ -199,7 +164,8 @@ if [ "$TEARDOWN_HAD_FAILURE" = "1" ]; then
   exit 1
 fi
 if [ "$DRY_RUN" = "1" ]; then
-  step "Dry run only. Nothing was deleted and no teardown notice was sent."
+  step "Dry run only. Nothing was deleted."
   exit 0
 fi
 step "Done. Captain GCS sync resources for ${SYNC_ID} removed."
+log "No API call needed: Captain detects the dead event source and reconcile keeps the sync consistent. Remove the sync in your Captain dashboard if you no longer want it."

@@ -1,9 +1,12 @@
 # =============================================================================
 # Inputs for the Captain R2 sync stack.
 #
-# Captain pre-fills sync_id, captain_secret, and the callback URLs when it
-# generates your deploy command. You supply the Cloudflare pieces: an API token
-# to run Terraform, your account id, and the bucket name.
+# From Captain you need two things: your sync id (sync_...) and your Captain
+# API key. The apply calls POST {captain_api_base}/v2/syncs/{sync_id}/webhooks
+# with that key and wires the Worker to the subscribe_url Captain mints. You
+# supply the Cloudflare pieces: an API token to run Terraform, your account id,
+# and the bucket name. You also choose captain_secret, the shared secret that
+# guards the Worker read proxy.
 #
 # Naming: Captain object ids are Stripe-style prefix_token (sync_..., dep_...).
 # No bare UUIDs. No em dashes anywhere.
@@ -43,7 +46,7 @@ variable "bucket_name" {
 }
 
 variable "sync_id" {
-  description = "Captain sync id (sync_<token>) this deployment enrolls. Captain fills this in."
+  description = "Captain sync id (sync_<token>) this deployment enrolls. Create the sync in Captain first; the id is in your dashboard."
   type        = string
 
   validation {
@@ -54,12 +57,14 @@ variable "sync_id" {
 
 variable "captain_secret" {
   description = <<-EOT
-    One-time enrollment secret minted by Captain for this sync. Doubles as the
-    bearer secret between Captain and the Worker. `sensitive = true` keeps it
-    out of CLI output, but it is still written to Terraform state IN
-    PLAINTEXT (Terraform state is not encrypted by design). Use an encrypted
-    remote backend (see versions.tf) before applying this against anything
-    real. To rotate, change this value and re-apply.
+    Shared secret YOU choose (16+ characters). It authenticates callers of the
+    Worker's /__captain/* read-proxy and self-test routes; configure the same
+    value on your Captain sync so Captain can use the read proxy. It is
+    unrelated to your Captain API key. `sensitive = true` keeps it out of CLI
+    output, but it is still written to Terraform state IN PLAINTEXT (Terraform
+    state is not encrypted by design). Use an encrypted remote backend (see
+    versions.tf) before applying this against anything real. To rotate, change
+    this value and re-apply.
   EOT
   type        = string
   sensitive   = true
@@ -70,25 +75,26 @@ variable "captain_secret" {
   }
 }
 
-variable "captain_ingest_url" {
-  description = "Captain endpoint the Worker POSTs object-change events to."
+variable "captain_api_key" {
+  description = <<-EOT
+    Your Captain API key. Sent as `Authorization: Bearer` on the apply-time
+    webhook subscribe call (POST {captain_api_base}/v2/syncs/{sync_id}/webhooks)
+    that mints the subscribe_url the Worker forwards events to. Stored in
+    Terraform state via the http data source's recorded request headers, so the
+    encrypted-backend requirement in versions.tf applies to this too.
+  EOT
   type        = string
-  default     = "https://api.runcaptain.com/v1/deploy/r2/ingest"
-
-  validation {
-    condition     = can(regex("^https://", var.captain_ingest_url))
-    error_message = "captain_ingest_url must be https."
-  }
+  sensitive   = true
 }
 
-variable "captain_enroll_url" {
-  description = "Captain enrollment endpoint the phone-home POSTs to. A non-2xx or verified!=true response fails the apply."
+variable "captain_api_base" {
+  description = "Base URL of the Captain API. Override for staging only; the canonical production base is https://api.captain.dev."
   type        = string
-  default     = "https://api.runcaptain.com/v1/deploy/r2/enroll"
+  default     = "https://api.captain.dev"
 
   validation {
-    condition     = can(regex("^https://", var.captain_enroll_url))
-    error_message = "captain_enroll_url must be https."
+    condition     = can(regex("^https://", var.captain_api_base))
+    error_message = "captain_api_base must be https."
   }
 }
 
@@ -109,7 +115,7 @@ variable "workers_subdomain" {
     Your account's workers.dev subdomain (the '<name>' in <name>.workers.dev),
     used to build the Worker's public URL for the keyless read proxy. Find it in
     the Workers dashboard or via `wrangler whoami`. Optional: leave empty to
-    enroll with the scoped read token only (no read proxy URL sent to Captain).
+    rely on the scoped read token only (no public read-proxy URL).
   EOT
   type        = string
   default     = ""

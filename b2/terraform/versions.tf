@@ -1,23 +1,25 @@
-# captain-b2-sync Terraform module (template version 2026-08-12)
+# captain-b2-sync Terraform module (template version 2026-08-13)
 #
 # IaC equivalent of setup/captain-b2-sync.sh for teams that manage cloud wiring
 # with Terraform. It stands up the SAME three things in your own Backblaze
-# account: a scoped read-only application key (the reconcile grant), a native B2
-# Event Notification rule (the latency path), and a self-verifying phone-home to
-# Captain so a clean `apply` means a CONFIRMED sync.
+# account: enrollment of the sync's event webhook with Captain's API (which
+# mints the per-sync subscribe URL), a native B2 Event Notification rule
+# targeting that URL (the latency path), and a scoped read-only application
+# key (the reconcile grant). A clean `apply` means an ENROLLED sync.
 #
 # Provider auth: set B2_APPLICATION_KEY_ID and B2_APPLICATION_KEY in the
 # environment (an operator key that can create keys + manage notifications).
 # These are used only by Terraform during apply; they are never sent to Captain.
+# Captain auth: set CAPTAIN_API_KEY in the environment; enroll_webhook.sh sends
+# it as an Authorization: Bearer header and it never enters the plan or state.
 #
 # STATE CONTAINS SECRETS. This stack's state holds the scoped read application
 # key (b2_application_key.captain_read.application_key) and the generated HMAC
 # secret (random_password.hmac.result) IN PLAINTEXT. Marking a value
 # `sensitive = true` only redacts it from CLI/plan output, it does not encrypt
-# state. (The Captain enrollment secret, var.secret, is NOT in this list: it is
-# passed only through the local-exec `environment` block on null_resource.enroll
-# and never lands in a resource attribute or in `triggers`, so it does not get
-# written to state. See variables.tf's description of `secret`.) You MUST point
+# state. (The Captain API key is NOT in this list: it travels only through the
+# CAPTAIN_API_KEY environment variable into enroll_webhook.sh and never lands
+# in a resource attribute, a data-source query, or state.) You MUST point
 # this stack at an encrypted remote backend before running it against anything
 # real, for example:
 #
@@ -36,8 +38,8 @@
 # and MUST NOT be used beyond a throwaway local test. If state is ever exposed,
 # rotate the scoped key (b2_delete_key on the old key id) and regenerate the
 # HMAC signing secret (taint random_password.hmac and re-apply). The Captain
-# enrollment secret does not need rotation on a state leak since it was never
-# written there; treat it as compromised only if it leaked some other way.
+# API key does not need rotation on a state leak since it was never written
+# there; treat it as compromised only if it leaked some other way.
 
 terraform {
   required_version = ">= 1.3.0"
@@ -51,9 +53,9 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.5"
     }
-    null = {
-      source  = "hashicorp/null"
-      version = "~> 3.2"
+    external = {
+      source  = "hashicorp/external"
+      version = "~> 2.3"
     }
   }
 }

@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
 #
-# captain-b2-sync.sh  (template version 2026-08-12)
+# captain-b2-sync.sh  (template version 2026-08-13)
 #
 # One command stands up everything Captain needs to keep a Backblaze B2 bucket
 # synced, entirely inside YOUR OWN Backblaze account:
 #
-#   1. EVENT WIRING       a native B2 Event Notification rule that webhooks
-#                         object create/delete straight to Captain's ingest
-#                         endpoint (the latency optimization).
-#   2. READ GRANT         a SCOPED, read-only application key restricted to the
-#                         one bucket, handed to Captain so it can list and fetch
-#                         objects over the S3-compatible endpoint (the always-on
-#                         reconcile/polling backstop). We NEVER hand Captain your
-#                         master key.
-#   3. SELF-VERIFY        a phone-home to Captain that makes Captain actually
-#                         prove it can read the bucket (and, when Event
-#                         Notifications are enabled on your account, that the
-#                         webhook is wired) BEFORE this script reports success.
-#                         If Captain cannot confirm, the script rolls back the
-#                         key and the rule it created and exits non-zero. A
-#                         green run means a CONFIRMED sync, not a hopeful one.
+#   1. ENROLLMENT         a call to Captain's real API
+#                         (POST {api}/v2/syncs/<sync-id>/webhooks) that mints
+#                         the per-sync subscribe URL for event delivery.
+#                         Captain answering 2xx with a subscribe_url IS the
+#                         enrollment; anything else rolls back what this run
+#                         created and exits non-zero. A green run means an
+#                         ENROLLED sync, not a hopeful one.
+#   2. EVENT WIRING       a native B2 Event Notification rule that webhooks
+#                         object create/delete straight to that minted
+#                         subscribe URL (the latency optimization).
+#   3. READ GRANT         a SCOPED, read-only application key restricted to the
+#                         one bucket, for Captain to list and fetch objects
+#                         over the S3-compatible endpoint (the always-on
+#                         reconcile/polling backstop). It is printed ONCE in
+#                         the success summary so you can set it as the sync's
+#                         credentials in Captain; your master key never leaves
+#                         your machine.
 #
 # Backblaze has no CloudFormation/console one-click and no cross-account
 # assume-role. The scoped application key IS the cross-account grant; it is
@@ -39,7 +41,7 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-TEMPLATE_VERSION="2026-08-12"
+TEMPLATE_VERSION="2026-08-13"
 SCRIPT_NAME="captain-b2-sync"
 USER_AGENT="captain-b2-setup/${TEMPLATE_VERSION}"
 
@@ -48,11 +50,11 @@ USER_AGENT="captain-b2-setup/${TEMPLATE_VERSION}"
 B2_AUTH_URL="https://api.backblazeb2.com/b2api/v3/b2_authorize_account"
 
 # ---------------------------------------------------------------------------
-# Defaults. Captain normally pre-fills --callback-url and --events-url when it
-# generates your setup command, so a customer only pastes and runs.
+# Defaults. The API base is Captain's production API; override with --api-base
+# (or CAPTAIN_API_BASE) only if Captain support points you at another
+# environment, for example staging.
 # ---------------------------------------------------------------------------
-DEFAULT_CALLBACK_URL="https://api.runcaptain.com/v1/deploy/b2/enroll"
-DEFAULT_EVENTS_URL="https://api.runcaptain.com/v1/deploy/b2/events"
+DEFAULT_API_BASE="https://api.captain.dev"
 
 # ---------------------------------------------------------------------------
 # Logging. Everything goes to stderr so stdout stays clean for machine-readable
@@ -75,22 +77,23 @@ usage() {
   cat >&2 <<EOF
 ${SCRIPT_NAME} (template ${TEMPLATE_VERSION})
 
-Wire a Backblaze B2 bucket to Captain: native event-notification webhook +
-scoped read-only application key + self-verifying phone-home.
+Wire a Backblaze B2 bucket to Captain: enroll the sync's event webhook with
+Captain's API, point a native B2 Event Notification rule at the minted
+subscribe URL, and mint a scoped read-only application key for reconcile.
 
 USAGE
-  ${SCRIPT_NAME}.sh provision [options]     stand up + verify (default command)
+  ${SCRIPT_NAME}.sh provision [options]     stand up + enroll (default command)
   ${SCRIPT_NAME}.sh teardown  [options]     remove the key + rule this created
   ${SCRIPT_NAME}.sh --help
 
 REQUIRED (provision)
   --sync-id       sync_<token>   Captain sync id this deployment enrolls.
-  --secret        <string>       One-time enrollment secret Captain minted for
-                                 this sync (>= 16 chars). Write-only; never logged.
-                                 PREFER the env var below: an argv flag is
-                                 visible to other local users via ps/proc and
-                                 lands in shell history.
-                                 (or set env CAPTAIN_ENROLL_SECRET)
+  --api-key       <string>       Your Captain API key (sent only as an
+                                 Authorization: Bearer header over TLS; never
+                                 logged). PREFER the env var below: an argv
+                                 flag is visible to other local users via
+                                 ps/proc and lands in shell history.
+                                 (or set env CAPTAIN_API_KEY)
   --bucket        <name>         EXISTING B2 bucket to sync. Not created here.
 
 OPERATOR CREDENTIALS (used ONLY during setup, never sent to Captain)
@@ -98,14 +101,14 @@ OPERATOR CREDENTIALS (used ONLY during setup, never sent to Captain)
   --b2-app-key    <appKey>       notifications on this bucket. Prefer a bucket-
                                  scoped admin key over the master key.
                                  PREFER the env vars below over these flags for
-                                 the same reason as --secret above.
+                                 the same reason as --api-key above.
   (or set env B2_APPLICATION_KEY_ID / B2_APPLICATION_KEY)
 
 OPTIONAL
-  --callback-url  <https url>    Captain enroll endpoint.
-                                 default: ${DEFAULT_CALLBACK_URL}
-  --events-url    <https url>    Captain ingest webhook the B2 rule points at.
-                                 default: ${DEFAULT_EVENTS_URL}?sync=<sync-id>
+  --api-base      <https url>    Captain API base the enrollment call targets.
+                                 default: ${DEFAULT_API_BASE}
+                                 (or set env CAPTAIN_API_BASE; override only
+                                 for staging, per Captain support)
   --key-duration  <seconds>      Expire the scoped read key after N seconds
                                  (rotation). Omit for a non-expiring key.
   --event-path    auto|force|skip
@@ -114,18 +117,18 @@ OPTIONAL
                                    on the account, warn and continue.
                                  force: treat a blocked event path as fatal.
                                  skip:  reconcile-only, do not touch rules.
-  --deployment-id dep_<token>    Reuse an id (teardown, or re-run). Otherwise
-                                 a fresh dep_<token> is generated.
-  --no-rollback                  On a failed verify, leave the key + rule in
-                                 place for inspection (default rolls them back).
+  --deployment-id dep_<token>    Reuse an id on a re-run. Otherwise a fresh
+                                 dep_<token> is generated.
+  --no-rollback                  On a failed enrollment, leave the key in
+                                 place for inspection (default rolls it back).
   --dry-run                      Preflight + auth + resolve, then stop. Creates
                                  nothing, sends nothing.
   --debug                        Verbose trace (or env CAPTAIN_DEBUG=1).
   --help
 
 EXIT CODES
-  0 success (verified)   1 usage/preflight   2 B2 API error
-  3 Captain verify failed (rolled back unless --no-rollback)
+  0 success (enrolled)   1 usage/preflight   2 B2 API error
+  3 Captain enrollment failed (rolled back unless --no-rollback)
 EOF
 }
 
@@ -213,7 +216,7 @@ preflight() {
   [ -n "$BUCKET" ]   || { usage; die "--bucket is required."; }
   case "$COMMAND" in
     provision)
-      [ -n "$SECRET" ] || { usage; die "--secret is required for provision."; }
+      [ -n "$API_KEY" ] || { usage; die "--api-key (or env CAPTAIN_API_KEY) is required for provision."; }
       ;;
   esac
 
@@ -221,13 +224,8 @@ preflight() {
     || die "--sync-id '${SYNC_ID}' is not of the form sync_<token>."
   printf '%s' "$BUCKET" | grep -Eq '^[a-z0-9][a-z0-9.-]{4,61}[a-z0-9]$' \
     || die "--bucket '${BUCKET}' is not a valid B2 bucket name (6-63 chars, lowercase letters/digits/'.'/'-')."
-  if [ "$COMMAND" = "provision" ] && [ "${#SECRET}" -lt 16 ]; then
-    die "--secret must be at least 16 characters (Captain mints this for the sync)."
-  fi
-  printf '%s' "$CALLBACK_URL" | grep -Eq '^https://' \
-    || die "--callback-url must be an https:// URL (the secret is only ever sent over TLS). Got: ${CALLBACK_URL}"
-  printf '%s' "$EVENTS_URL" | grep -Eq '^https://' \
-    || die "--events-url must be an https:// URL. Got: ${EVENTS_URL}"
+  printf '%s' "$API_BASE" | grep -Eq '^https://' \
+    || die "--api-base must be an https:// URL (the API key is only ever sent over TLS). Got: ${API_BASE}"
 
   [ -n "$B2_KEY_ID" ]  || die "Operator B2 key id missing. Pass --b2-key-id or set B2_APPLICATION_KEY_ID."
   [ -n "$B2_APP_KEY" ] || die "Operator B2 app key missing. Pass --b2-app-key or set B2_APPLICATION_KEY."
@@ -339,7 +337,7 @@ get_rules() {
 
 set_notification_rule() {
   local rname; rname="$(rule_name)"
-  log "Setting Event Notification rule '${rname}' -> ${EVENTS_URL} (additive; sibling rules preserved)."
+  log "Setting Event Notification rule '${rname}' -> ${SUBSCRIBE_URL} (additive; sibling rules preserved)."
 
   get_rules
   if [ "$HTTP_CODE" != "200" ]; then
@@ -361,7 +359,7 @@ set_notification_rule() {
 
   local merged
   merged="$(printf '%s' "$HTTP_BODY" | jq -c \
-    --arg b "$BUCKET_ID" --arg name "$rname" --arg url "$EVENTS_URL" --arg hmac "$HMAC_SECRET" '
+    --arg b "$BUCKET_ID" --arg name "$rname" --arg url "$SUBSCRIBE_URL" --arg hmac "$HMAC_SECRET" '
       { bucketId: $b,
         eventNotificationRules:
           ((.eventNotificationRules // [])
@@ -415,8 +413,8 @@ die_api() { local c="$1"; shift; err "$*"; exit "$c"; }
 
 rollback() {
   if [ "$NO_ROLLBACK" = "1" ]; then
-    warn "--no-rollback: leaving the scoped key and notification rule in place for inspection."
-    warn "Read key id: ${READ_KEY_ID:-none}. Notification rule: $(rule_name). Remove with: ${SCRIPT_NAME}.sh teardown --sync-id ${SYNC_ID} --bucket ${BUCKET}"
+    warn "--no-rollback: leaving what this run created in place for inspection."
+    warn "Read key id: ${READ_KEY_ID:-none}. Remove with: ${SCRIPT_NAME}.sh teardown --sync-id ${SYNC_ID} --bucket ${BUCKET}"
     return 0
   fi
   warn "Rolling back what this run created."
@@ -425,63 +423,39 @@ rollback() {
 }
 
 # ---------------------------------------------------------------------------
-# Self-verifying phone-home to Captain
+# Enrollment: subscribe this sync's event webhook with Captain's API.
+#
+# POST {API_BASE}/v2/syncs/<sync-id>/webhooks with a Bearer API key and an
+# empty JSON body (B2 is not an SNS-backed source, so no sns_topic_arn).
+# Captain answers 2xx with:
+#   subscribe_url   the per-sync ingest URL it minted (our rule's target)
+#   secret_set      whether a webhook secret is set on Captain's side
+#   instructions    human-readable next steps
+# The 2xx + subscribe_url response IS the successful enrollment. Anything else
+# rolls back the key this run minted and exits 3.
 # ---------------------------------------------------------------------------
-phone_home() {
-  local action="$1"
-  local payload redacted
-  payload="$(jq -nc \
-    --arg dep   "$DEPLOYMENT_ID" \
-    --arg ver   "$TEMPLATE_VERSION" \
-    --arg act   "$action" \
-    --arg sync  "$SYNC_ID" \
-    --arg sec   "$SECRET" \
-    --arg acct  "$ACCOUNT_ID" \
-    --arg bkt   "$BUCKET" \
-    --arg bid   "$BUCKET_ID" \
-    --arg s3url "$S3_URL" \
-    --arg s3reg "$S3_REGION" \
-    --arg kid   "${READ_KEY_ID:-}" \
-    --arg akey  "${READ_APP_KEY:-}" \
-    --arg evurl "$EVENTS_URL" \
-    --arg est   "${EVENT_STATUS:-skipped}" \
-    --arg rname "$(rule_name)" \
-    --arg hmac  "$HMAC_SECRET" \
-    '{
-       deploymentId: $dep, templateVersion: $ver, action: $act, provider: "backblaze-b2",
-       syncId: $sync, secret: $sec,
-       account: { accountId: $acct },
-       bucket:  { name: $bkt, id: $bid },
-       s3Compatible: { endpoint: $s3url, region: $s3reg, keyId: $kid, applicationKey: $akey },
-       events: { status: $est, ruleName: $rname, webhookUrl: $evurl, hmacSha256SigningSecret: $hmac }
-     }')"
-  # Redacted copy for logs: strip every secret-bearing field.
-  redacted="$(printf '%s' "$payload" | jq -c '
-    .secret = "***" | .s3Compatible.applicationKey = "***" | .events.hmacSha256SigningSecret = "***"')"
-  log "Phoning home to Captain (${action}): ${redacted}"
+enroll_webhook() {
+  local url="${API_BASE%/}/v2/syncs/${SYNC_ID}/webhooks"
+  log "Enrolling sync ${SYNC_ID} with Captain: POST ${url} (API key sent as a Bearer header, never logged)."
 
-  http_call POST "$CALLBACK_URL" --auth-token "captain-secret ${SECRET}" --json "$payload"
+  http_call POST "$url" --auth-token "Bearer ${API_KEY}" --json '{}'
 
-  if [ "$action" = "delete" ]; then
-    # Teardown notice is best-effort; never block teardown on it.
-    [ "$HTTP_CODE" = "200" ] || warn "Teardown notice to Captain returned HTTP ${HTTP_CODE} (tolerated)."
-    return 0
+  if [ "$HTTP_CODE" -ge 200 ] 2>/dev/null && [ "$HTTP_CODE" -lt 300 ] 2>/dev/null; then
+    SUBSCRIBE_URL="$(printf '%s' "$HTTP_BODY" | jq -r '.subscribe_url // empty' 2>/dev/null || true)"
+    SECRET_SET="$(printf '%s' "$HTTP_BODY" | jq -r '.secret_set // false' 2>/dev/null || echo false)"
+    CAPTAIN_INSTRUCTIONS="$(printf '%s' "$HTTP_BODY" | jq -c '.instructions // []' 2>/dev/null || echo '[]')"
+    if [ -n "$SUBSCRIBE_URL" ]; then
+      log "Captain ENROLLED the sync (HTTP ${HTTP_CODE}). subscribe_url minted; secret_set=${SECRET_SET}."
+      return 0
+    fi
   fi
 
-  local verified
-  verified="$(printf '%s' "$HTTP_BODY" | jq -r '.verified // false' 2>/dev/null || echo false)"
-  if [ "$HTTP_CODE" -ge 200 ] 2>/dev/null && [ "$HTTP_CODE" -lt 300 ] 2>/dev/null && [ "$verified" = "true" ]; then
-    CAPTAIN_STATUS="$(printf '%s' "$HTTP_BODY" | jq -r '.status // "verified"' 2>/dev/null || echo verified)"
-    log "Captain CONFIRMED enrollment (status: ${CAPTAIN_STATUS})."
-    return 0
-  fi
-
-  err "Captain did NOT confirm enrollment."
-  err "  HTTP ${HTTP_CODE}, verified=${verified}"
+  err "Captain enrollment failed."
+  err "  POST ${url} returned HTTP ${HTTP_CODE}."
   err "  Response: $(printf '%s' "$HTTP_BODY" | head -c 400)"
-  err "  Likely causes: wrong --secret or --sync-id, the scoped key cannot read the bucket over ${S3_URL}, or Captain's enroll endpoint is unreachable."
+  err "  Likely causes: wrong --sync-id, an invalid or revoked Captain API key, or ${API_BASE} unreachable from this machine."
   rollback
-  die_api 3 "Enrollment failed verification (see above)."
+  die_api 3 "Captain enrollment failed (no 2xx + subscribe_url; see above)."
 }
 
 # ---------------------------------------------------------------------------
@@ -498,37 +472,45 @@ do_provision() {
   log "Deployment id: ${DEPLOYMENT_ID}"
 
   if [ "$DRY_RUN" = "1" ]; then
-    log "--dry-run: preflight/auth/resolve done. Would mint a scoped read key, set rule '$(rule_name)', and phone home to ${CALLBACK_URL}. Nothing was created."
+    log "--dry-run: preflight/auth/resolve done. Would mint a scoped read key, enroll the webhook via POST ${API_BASE%/}/v2/syncs/${SYNC_ID}/webhooks, and set rule '$(rule_name)'. Nothing was created."
     printf '{"dryRun":true,"deploymentId":"%s","bucketId":"%s","s3Endpoint":"%s","region":"%s","eventPath":"%s"}\n' \
       "$DEPLOYMENT_ID" "$BUCKET_ID" "$S3_URL" "$S3_REGION" "$EVENT_PATH"
     return 0
   fi
 
   mint_read_key
+  enroll_webhook
   if [ "$EVENT_PATH" = "skip" ]; then
     EVENT_STATUS="skipped"
-    log "--event-path skip: reconcile-only, not touching notification rules."
+    log "--event-path skip: reconcile-only, not touching notification rules. The minted subscribe URL stays valid for when you enable events."
   else
     set_notification_rule
   fi
-  phone_home create
 
-  log "SUCCESS. Deployment ${DEPLOYMENT_ID} is enrolled and verified."
-  # Machine-readable summary on stdout (secrets excluded).
+  log "SUCCESS. Deployment ${DEPLOYMENT_ID} is enrolled with Captain."
+  # Machine-readable summary on stdout. The scoped read key's secret half
+  # appears here ONCE, on stdout only (never in the stderr logs), so you can
+  # set it as this sync's credentials in Captain. Everything else stays
+  # redacted everywhere.
   jq -nc \
     --arg dep "$DEPLOYMENT_ID" --arg sync "$SYNC_ID" --arg bkt "$BUCKET" \
-    --arg bid "$BUCKET_ID" --arg kid "$READ_KEY_ID" --arg s3 "$S3_URL" \
+    --arg bid "$BUCKET_ID" --arg kid "$READ_KEY_ID" --arg akey "$READ_APP_KEY" \
+    --arg s3 "$S3_URL" \
     --arg reg "$S3_REGION" --arg est "${EVENT_STATUS:-skipped}" \
-    --arg cap "${CAPTAIN_STATUS:-verified}" \
-    '{ status:"verified", deploymentId:$dep, syncId:$sync,
-       bucket:$bkt, bucketId:$bid, readKeyId:$kid,
-       s3Endpoint:$s3, region:$reg, eventPath:$est, captainStatus:$cap,
-       whatToDoNext: ("Enrollment " + $dep + " verified. Open your Captain dashboard for sync " + $sync + "; a targeted reconcile of " + $bkt + " runs now, and future changes " + (if $est=="enabled" then "webhook in near-real-time." else "sync via the reconcile backstop (event path: " + $est + ").")) }'
+    --arg sub "$SUBSCRIBE_URL" --arg ss "${SECRET_SET:-false}" \
+    --argjson ins "${CAPTAIN_INSTRUCTIONS:-[]}" \
+    '{ status:"enrolled", deploymentId:$dep, syncId:$sync,
+       bucket:$bkt, bucketId:$bid,
+       readKeyId:$kid, readApplicationKey:$akey,
+       s3Endpoint:$s3, region:$reg, eventPath:$est,
+       subscribeUrl:$sub, secretSet:($ss=="true"), captainInstructions:$ins,
+       whatToDoNext: ("Enrollment " + $dep + " complete for sync " + $sync + ". If this sync does not already use the scoped read key above as its credentials, set it in Captain (https://docs.captain.dev/guides/sync/set-up). Future changes to " + $bkt + " " + (if $est=="enabled" then "webhook to the subscribe URL in near-real-time." else "sync via the scheduled reconcile backstop (event path: " + $est + ")." end)) }'
 }
 
 do_teardown() {
-  # Teardown does not need --secret for the B2 side; it does for the best-effort
-  # Captain notice. Keep going even if the notice cannot be sent.
+  # Teardown is entirely B2-side: remove our rule, delete our keys. There is
+  # no unsubscribe call to Captain; Captain detects the dead event source and
+  # the scheduled reconcile backstop keeps the sync consistent.
   preflight
   authorize
   set_auth_token "$HTTP_BODY"
@@ -557,17 +539,7 @@ do_teardown() {
     warn "b2_list_keys failed (HTTP ${HTTP_CODE}); delete the '${keyname}' key by hand if it remains."
   fi
 
-  # Best-effort Captain teardown notice.
-  [ -n "$DEPLOYMENT_ID" ] || DEPLOYMENT_ID="dep_teardown"
-  HMAC_SECRET=""
-  READ_KEY_ID=""; READ_APP_KEY=""
-  if [ -n "$SECRET" ]; then
-    EVENT_STATUS="removed"
-    phone_home delete
-  else
-    warn "No --secret given; skipping the Captain teardown notice (B2 resources were still removed)."
-  fi
-  log "Teardown complete for sync ${SYNC_ID} on bucket ${BUCKET}."
+  log "Teardown complete for sync ${SYNC_ID} on bucket ${BUCKET}. Captain notices the removed event source on its own; the reconcile backstop keeps the sync consistent until you pause or delete it in Captain."
 }
 
 # ---------------------------------------------------------------------------
@@ -575,12 +547,11 @@ do_teardown() {
 # ---------------------------------------------------------------------------
 COMMAND="provision"
 SYNC_ID=""
-SECRET="${CAPTAIN_ENROLL_SECRET:-}"
+API_KEY="${CAPTAIN_API_KEY:-}"
 BUCKET=""
 B2_KEY_ID="${B2_APPLICATION_KEY_ID:-}"
 B2_APP_KEY="${B2_APPLICATION_KEY:-}"
-CALLBACK_URL="$DEFAULT_CALLBACK_URL"
-EVENTS_URL=""
+API_BASE="${CAPTAIN_API_BASE:-$DEFAULT_API_BASE}"
 KEY_DURATION=""
 EVENT_PATH="auto"
 DEPLOYMENT_ID=""
@@ -590,7 +561,7 @@ DRY_RUN=0
 # State set later
 API_URL=""; S3_URL=""; ACCOUNT_ID=""; CAPS=""; S3_REGION=""; AUTH_TOKEN=""
 BUCKET_ID=""; READ_KEY_ID=""; READ_APP_KEY=""; HMAC_SECRET=""
-EVENT_STATUS=""; CAPTAIN_STATUS=""
+EVENT_STATUS=""; SUBSCRIBE_URL=""; SECRET_SET=""; CAPTAIN_INSTRUCTIONS="[]"
 CREATED_KEY=0; CREATED_RULE=0
 HTTP_BODY=""; HTTP_CODE=""
 
@@ -605,12 +576,11 @@ esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --sync-id)       SYNC_ID="${2:-}"; shift 2 ;;
-    --secret)        SECRET="${2:-}"; shift 2 ;;
+    --api-key)       API_KEY="${2:-}"; shift 2 ;;
     --bucket)        BUCKET="${2:-}"; shift 2 ;;
     --b2-key-id)     B2_KEY_ID="${2:-}"; shift 2 ;;
     --b2-app-key)    B2_APP_KEY="${2:-}"; shift 2 ;;
-    --callback-url)  CALLBACK_URL="${2:-}"; shift 2 ;;
-    --events-url)    EVENTS_URL="${2:-}"; shift 2 ;;
+    --api-base)      API_BASE="${2:-}"; shift 2 ;;
     --key-duration)  KEY_DURATION="${2:-}"; shift 2 ;;
     --event-path)    EVENT_PATH="${2:-}"; shift 2 ;;
     --deployment-id) DEPLOYMENT_ID="${2:-}"; shift 2 ;;
@@ -621,11 +591,6 @@ while [ $# -gt 0 ]; do
     *) usage; die "Unknown option '${1}'." ;;
   esac
 done
-
-# Default the events URL to the enroll host's /events path tagged with the sync.
-if [ -z "$EVENTS_URL" ]; then
-  EVENTS_URL="${DEFAULT_EVENTS_URL}?sync=${SYNC_ID}"
-fi
 
 log "${SCRIPT_NAME} ${TEMPLATE_VERSION} :: command=${COMMAND} sync=${SYNC_ID:-?} bucket=${BUCKET:-?} event-path=${EVENT_PATH} dry-run=${DRY_RUN}"
 

@@ -1,7 +1,7 @@
 # Outputs are written to tell the tester exactly what happened and what to do next.
 
 output "deployment_id" {
-  description = "Stripe-style deployment id (dep_<token>) bound to this enrollment."
+  description = "Stripe-style deployment id (dep_<token>) local to this stack; a stable reference for support and audit trails."
   value       = local.deployment_id
 }
 
@@ -42,12 +42,22 @@ output "read_token_expires_on" {
   value       = var.read_token_ttl_days > 0 ? timeadd(time_static.read_token_created.rfc3339, "${var.read_token_ttl_days * 24}h") : "never"
 }
 
-output "captain_enrollment_verified" {
-  description = "True once Captain has confirmed both event delivery and read access. If the apply reached this output, it is verified (the postcondition gates it)."
-  value       = try(jsondecode(data.http.enroll.response_body).verified, false)
+output "captain_subscribe_url" {
+  description = "The per-sync ingest URL Captain minted via POST {captain_api_base}/v2/syncs/{sync_id}/webhooks. The Worker forwards object-change events here. If the apply reached this output, the subscription is confirmed (the postcondition gates it)."
+  value       = local.captain_ingest_url
+}
+
+output "captain_webhook_secret_set" {
+  description = "Whether Captain reports a webhook secret is set on this sync (secret_set from the subscribe response)."
+  value       = try(jsondecode(data.http.subscribe.response_body).secret_set, false)
+}
+
+output "captain_instructions" {
+  description = "Any next-step instructions Captain returned with the subscription."
+  value       = try(jsondecode(data.http.subscribe.response_body).instructions, [])
 }
 
 output "what_to_do_next" {
   description = "One-line next step."
-  value       = "Deployment ${local.deployment_id} is enrolled and verified for sync ${var.sync_id}. Captain reconciles ${var.bucket_name} now and future object changes sync near-real-time. If the Queue path looks silent, POST /__captain/selftest on the Worker and watch `wrangler tail`."
+  value       = "Deployment ${local.deployment_id} is enrolled for sync ${var.sync_id}: Captain minted the subscribe_url and the Worker forwards events to it. Feed read_access_key_id / read_secret_access_key into your Captain R2 sync, then Captain reconciles ${var.bucket_name} and future object changes sync near-real-time. If the Queue path looks silent, POST /__captain/selftest on the Worker and watch `wrangler tail`."
 }

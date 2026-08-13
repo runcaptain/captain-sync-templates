@@ -135,4 +135,5 @@ run_step "Deleting dead-letter queue $DLQ_NAME" "not found|does not exist" \
 
 log "Done. Torn down: event notification, secret, queue consumer, Worker $WORKER_NAME, queues $QUEUE_NAME + $DLQ_NAME."
 echo "  - R2 bucket $BUCKET_NAME was NOT touched (this stack never created it)."
+echo "  - No Captain-side call is made here: Captain detects the dead event source on its own, and scheduled reconcile continues as the backstop."
 echo "  - If this sync should also stop reconciling in Captain, delete it there too (captain_delete_sync / dashboard)."

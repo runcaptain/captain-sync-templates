@@ -3,15 +3,16 @@
 One click stands up everything Captain needs to keep an S3 bucket synced in your
 own AWS account: an SNS topic fed by the bucket's change events, a read-only
 cross-account role Captain assumes (no long-lived keys), and a self-verifying
-custom resource that phones home so a green stack actually means a working sync.
+custom resource that registers the topic with the Captain API so a green stack
+actually means a working sync.
 
 Prefer Terraform? The same deploy, built the same self-verifying way, is in
 [`../terraform`](../terraform).
 
-One thing to know today: Captain's enrollment verification for this template is
-not yet activated, so a deploy currently completes the setup steps in your
-account and then reports unverified at the final step. Contact Captain for
-activation status for your sync.
+What you need before launching: your Captain sync id (`sync_<token>`) and a
+Captain API key. Captain normally pre-fills both when it generates your Launch
+Stack link. Full walkthrough:
+[docs.captain.dev/guides/sync/set-up](https://docs.captain.dev/guides/sync/set-up).
 
 ## Launch Stack
 
@@ -32,8 +33,8 @@ file", or deploy from the CLI with
 `aws cloudformation deploy --template-file captain-s3-sync.yaml
 --stack-name captain-s3-sync --capabilities CAPABILITY_NAMED_IAM
 --parameter-overrides BucketName=<bucket> CaptainAccountId=<id>
-SyncId=<sync_id> ExternalId=<id> Secret=<secret>` (every parameter without
-a default must be passed; use the values Captain gave you).
+SyncId=<sync_id> ExternalId=<id> CaptainApiKey=<api key>` (every parameter
+without a default must be passed; use the values Captain gave you).
 
 Captain normally generates the whole launch link per sync and pre-fills the
 parameters, so you only review and click Create.
@@ -44,11 +45,11 @@ Captain pre-fills the enrollment parameters; you confirm them and set the bucket
 
 | Parameter | Who fills it | What it is |
 | --- | --- | --- |
-| `CaptainCallbackUrl` | Captain | The https enroll endpoint the phone-home POSTs to. |
+| `CaptainApiBase` | Captain | Base URL of the Captain API. Defaults to production (`https://api.captain.dev`); override only for a staging environment. |
 | `CaptainAccountId` | Captain | Captain's AWS account id; the read role trusts it. |
 | `SyncId` | Captain | The Captain sync id (`sync_<token>`) this deploy enrolls. |
 | `ExternalId` | Captain | Per-sync external id, the confused-deputy guard. |
-| `Secret` | Captain | One-time enrollment secret (write-only, `NoEcho`). |
+| `CaptainApiKey` | Captain | Your Captain API key (write-only, `NoEcho`). Sent as a bearer token to the Captain API. |
 | `BucketName` | You | The EXISTING bucket to sync. The stack does not create it. |
 | `ObjectPrefix` | You (optional) | Restrict the sync to a key prefix, e.g. `docs/`. Empty = whole bucket. |
 | `KmsKeyArn` | You (optional) | REQUIRED if the bucket is SSE-KMS with a customer-managed key (see below). |
@@ -112,21 +113,23 @@ is wrong, and the sync just silently never works. This template closes the loop.
 1. CloudFormation creates the SNS topic, its access policy, and the read role.
 2. A custom resource points the bucket's notifications at the topic (see the
    pre-existing-bucket note below for why this is a custom resource).
-3. The `EnrollWithCaptain` custom resource POSTs the enrollment facts to
-   `CaptainCallbackUrl`: `stackId`, `region`, `bucket`, `objectPrefix`,
-   `kmsKeyArn`, `snsTopicArn`, `roleArn`, `externalId`, `syncId`, `secret`, and a
-   generated `deploymentId` (`dep_<token>`).
-4. Captain subscribes its endpoint to the topic, assumes the read role with the
-   external id (proving the trust and policy really work), runs a verification
-   handshake, and returns `2xx` with `{"verified": true}` only if all of that
-   succeeded.
-5. The custom resource sends `SUCCESS` to CloudFormation only on a verified
-   response. Any non-2xx, timeout, or unverified reply becomes `FAILED` with a
-   human-readable reason, which rolls the stack back.
+3. The `EnrollWithCaptain` custom resource POSTs to
+   `{CaptainApiBase}/v2/syncs/{SyncId}/webhooks` with
+   `Authorization: Bearer {CaptainApiKey}` and the body
+   `{"sns_topic_arn": "<the topic the stack just created>"}` (required for
+   S3-family syncs; the API returns 422 without it).
+4. Captain subscribes to the topic and returns `2xx` JSON with `subscribe_url`
+   (the per-sync ingest URL Captain minted), `secret_set`, and `instructions`.
+   A `2xx` with a `subscribe_url` IS successful enrollment: Captain
+   subscribing to the topic is the verification.
+5. The custom resource sends `SUCCESS` to CloudFormation only on that
+   response. Any non-2xx, timeout, or reply without a `subscribe_url` becomes
+   `FAILED` with a human-readable reason, which rolls the stack back.
 
-So a `CREATE_COMPLETE` stack means Captain has confirmed, end to end, that it can
-both receive change events and read your objects. On stack delete the resource
-POSTs a teardown notice (best-effort, never blocks the delete).
+So a `CREATE_COMPLETE` stack means Captain has accepted the topic registration
+and minted this sync's `subscribe_url` (also surfaced as the `SubscribeUrl`
+output). On stack delete the resource makes no Captain call: Captain detects
+the removed topic, and reconcile remains the backstop.
 
 ## Log group cleanup on delete
 
@@ -161,9 +164,9 @@ aws logs delete-log-group --log-group-name "/captain/s3-sync/<syncId>/<attemptTo
 
 - CloudFormation console, your stack, the Events tab. The failed resource
   (`EnrollWithCaptain` or `SetBucketNotification`) carries a status reason with
-  the actual error, for example `Captain callback returned HTTP 403: unknown
-  sync`, `Preflight failed: CaptainCallbackUrl must be https://`, or
-  `Could not reach Captain callback: <urlopen timeout>`.
+  the actual error, for example `Captain API returned HTTP 403: unknown
+  sync`, `Preflight failed: CaptainApiBase must be https://`, or
+  `Could not reach the Captain API: <urlopen timeout>`.
 - The full step-by-step is in the Lambda CloudWatch logs (30-day retention),
   under the `CAPTAIN-ENROLL` and `CAPTAIN-SETNOTIF` prefixes:
   - enroll: `/captain/s3-sync/<syncId>/<attemptToken>/enroll`
@@ -171,19 +174,19 @@ aws logs delete-log-group --log-group-name "/captain/s3-sync/<syncId>/<attemptTo
   Find them with `aws logs describe-log-groups --log-group-name-prefix
   "/captain/s3-sync/<syncId>/"` (the `<attemptToken>` is unique per launch
   attempt; on a successful deploy the `DebugLogsHere` output prints both full
-  names). These log every step (preflight, phone-home request, Captain's
-  response, the merge that preserves your existing hooks). The one-time
-  `Secret` is NEVER logged; it is redacted to its length. Set
+  names). These log every step (preflight, the webhook registration request,
+  Captain's response, the merge that preserves your existing hooks). The
+  `CaptainApiKey` is NEVER logged; it is redacted to its length. Set
   `DebugLogging=false` to quiet them after the sync is up.
 - Captain's side: the `DeploymentId` output (`dep_<token>`) identifies this
-  deploy attempt to Captain. Share it with Captain support to check what
-  Captain saw: whether the topic subscription and the assume-role probe
-  passed, and the last handshake result.
-- Common causes: wrong `CaptainAccountId` (assume-role trust fails), an external
-  id that does not match the sync, launching in a different region than the
-  bucket, an SSE-KMS bucket without `KmsKeyArn` (reads fail `AccessDenied`), or
-  the bucket already having an `ObjectCreated`/`ObjectRemoved` notification hook
-  on an overlapping prefix. That last one fails at `SetBucketNotification` with
+  deploy attempt. Share it with Captain support to check what Captain saw for
+  the registration.
+- Common causes: a `SyncId` or `CaptainApiKey` the Captain API rejects (the
+  Reason carries Captain's HTTP status and body), wrong `CaptainAccountId`
+  (assume-role trust fails), an external id that does not match the sync,
+  launching in a different region than the bucket, an SSE-KMS bucket without
+  `KmsKeyArn` (reads fail `AccessDenied`), or the bucket already having an
+  `ObjectCreated`/`ObjectRemoved` notification hook on an overlapping prefix. That last one fails at `SetBucketNotification` with
   a Reason naming the conflicting hook's id, event, and prefix. See
   "Pre-existing bucket: the notification constraint" below for what to do about
   it.
@@ -283,14 +286,18 @@ aws s3api put-bucket-notification-configuration --bucket "$BUCKET" --region "$RE
 
 Delete the stack (console, or `aws cloudformation delete-stack --stack-name
 captain-s3-sync --region <region>`). The delete removes only the Captain
-notification config from your bucket (other hooks are left alone), POSTs
-Captain a best-effort teardown notice, and tears down the topic, roles, and
-Lambdas. Your bucket and objects are never touched. See "Log group cleanup on
-delete" above for the one cosmetic thing a delete can leave behind.
+notification config from your bucket (other hooks are left alone) and tears
+down the topic, roles, and Lambdas. No Captain call is made on teardown:
+Captain detects the dead event source once the topic is gone, and reconcile
+remains the backstop. Your bucket and objects are never touched. See "Log
+group cleanup on delete" above for the one cosmetic thing a delete can leave
+behind.
 
 ## Outputs
 
-- `DeploymentId`: the `dep_<token>` id; use it to look up deployment state.
+- `DeploymentId`: the `dep_<token>` id; share it with Captain support to
+  identify this deploy attempt.
+- `SubscribeUrl`: the per-sync ingest URL Captain minted at enrollment.
 - `SnsTopicArn`: topic the bucket publishes to and Captain subscribes to.
 - `ReadRoleArn`: the cross-account read role Captain assumes.
 - `ExternalId`: echoed back for your records.

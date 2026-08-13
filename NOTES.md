@@ -12,31 +12,40 @@ NOTES.md covering that provider's design decisions and testing guidance.
   deployment ids, `sync_...` sync ids). No bare UUIDs in outputs.
 - No em dashes anywhere in customer-facing copy.
 
-## The self-verifying deploy contract
+## The enroll contract
 
-Every template phones home to a Captain enroll receiver at the end of a
-deploy and requires a `2xx` response with `{"verified": true}` before it
-reports success. The receiver is expected to prove the grant actually works
-(subscribe to the topic, assume the role, probe-read the bucket) before
-returning `verified: true`; anything else fails the deploy, and on
-CloudFormation rolls the stack back. Enrollment verification is not yet
-activated on the Captain backend, so a live end-to-end deploy currently
-reaches the phone-home step and fails there by design (fail-closed).
-Everything up to that step is exercisable today.
+Every template enrolls its event wiring with Captain at the end of a deploy:
 
-For AWS S3 the enroll POST body is `{deploymentId, templateVersion, action,
-stackId, partition, region, bucket, objectPrefix, kmsKeyArn, snsTopicArn,
-roleArn, externalId, syncId, secret}` (`objectPrefix` and `kmsKeyArn` are
-empty strings when unset).
-The receiver must authenticate `secret` against `syncId`, subscribe its
-endpoint to `snsTopicArn` (the topic policy allows Captain's account to
-`sns:Subscribe`, and the receiver must handle SNS's
-`SubscriptionConfirmation` message), and assume `roleArn` with
-`sts:ExternalId = externalId` for a probe `ListBucket`/`GetObject`. On stack
-delete the custom resource POSTs `{action: "delete", ...}` best-effort; it
-never blocks a stack delete, so the backend should reconcile orphaned
-subscriptions. Each other cloud's NOTES.md lists its own payload shape for
-the same class of receiver.
+```
+POST {API_BASE}/v2/syncs/{sync_id}/webhooks
+Authorization: Bearer {CAPTAIN_API_KEY}
+```
+
+`API_BASE` defaults to `https://api.captain.dev` and stays overridable via a
+template parameter or environment variable for staging. Two body shapes,
+nothing else:
+
+- S3-family syncs (anything delivering through an SNS topic) send
+  `{"sns_topic_arn": "arn:aws:sns:..."}`. Required: the API returns `422`
+  without it.
+- Every other sync sends an empty JSON object, `{}`.
+
+Each cloud folder's NOTES.md says which shape that provider uses.
+
+A `2xx` JSON response is successful enrollment. It contains `subscribe_url`
+(the per-sync ingest/hook URL Captain minted), `secret_set` (bool), and
+`instructions` (array of strings the deploy should surface to the operator).
+The deploy requires that `2xx` with a `subscribe_url` before reporting
+success; anything else fails the deploy, and on CloudFormation rolls the
+stack back (fail-closed). The customer needs their `sync_...` sync id and
+Captain API key up front; Captain pre-generates launch links and keys per
+sync. Logging keeps the redaction discipline: never print the API key or
+any minted secret, only ids and redacted placeholders.
+
+Teardown makes no enroll-side call. There is no documented unsubscribe
+endpoint and the templates must not invent one: teardown removes the
+cloud-side resources, Captain detects the dead event source, and the
+reconcile pass is the backstop.
 
 ## S3 bucket notifications: additive merge with a pre-write overlap check
 
@@ -92,8 +101,8 @@ This is deliberate. The obvious alternative, a `timestamp()`-based
 it destroys and recreates the invocation on every apply, not just retries.
 For `setnotif` that removes and re-adds the live bucket notification config
 on every unrelated apply (a real window with no hook); for `enroll` it
-re-sends the one-time enrollment secret on every unrelated apply, which
-breaks a working sync once the backend enforces one-time use. There is no
+re-POSTs the webhook enrollment against a working sync on every unrelated
+apply, churning state that did not need to change. There is no
 clean way to detect "the last apply's postcondition failed" from inside the
 same config without reducing to the same manual action while adding
 complexity, so a loud, explicit manual-retry message wins.
@@ -161,10 +170,9 @@ failed apply, so there is no delete race and no name collision on re-apply.
 
 All five are built: AWS S3, GCP GCS, Azure Blob, Cloudflare R2, and
 Backblaze B2, each with a template or script, a customer README, and a
-NOTES.md. All share the fail-closed enroll contract above; none can
-complete a real customer launch until the Captain enroll receivers are
-activated. Provider-specific constraints worth knowing before you touch
-one:
+NOTES.md. All share the fail-closed enroll contract above. A real customer
+launch needs the sync id and Captain API key that Captain pre-generates per
+sync. Provider-specific constraints worth knowing before you touch one:
 
 - **AWS S3**: the single-notification-slot overlap rule above.
 - **GCP GCS**: buckets allow multiple notification configs, so there is no
@@ -189,8 +197,9 @@ Static checks, all expected clean:
   `aws/terraform`.
 
 For a live test, use a throwaway, uniquely named bucket and stack in an
-account you own, with a mock enroll endpoint standing in for the Captain
-receiver (the real one is not activated yet, so a real endpoint 404s).
+account you own, with either a real sync id and Captain API key or, if you
+do not want to burn a real sync, the API base override pointed at a mock
+enroll endpoint that mimics `POST /v2/syncs/{sync_id}/webhooks`.
 Worthwhile scenarios: a deploy against a bucket that already has an
 `ObjectCreated` hook (must fail fast at `SetBucketNotification` naming the
 conflicting hook, and must leave the sibling hook untouched); a

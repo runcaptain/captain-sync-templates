@@ -32,13 +32,12 @@ Every template stands up the same three things in your account:
    Pub/Sub, Event Grid, Queues, or webhooks, depending on the cloud).
 2. **A read-only grant** Captain uses to list and fetch objects. No long-lived
    master keys ever leave your account.
-3. **A self-verifying phone-home**: the deploy only reports success after
-   Captain confirms it can actually receive events and read the bucket.
+3. **An enroll call to Captain**: the deploy registers the new event wiring
+   with Captain's API and only reports success once Captain returns your
+   sync's subscribe URL.
 
-One thing to know today: the Captain endpoint that performs that final
-verification is not yet live, so a deploy currently completes the setup steps
-in your account and then reports unverified at the last step. Contact Captain
-for activation status for your sync.
+One thing to know today: Captain pre-generates the launch links and keys per
+sync, so have your sync id and Captain API key from Captain before you launch.
 
 ## Layout
 
@@ -69,7 +68,7 @@ captain-sync-templates/
   b2/
     README.md                        setup script vs Terraform, event-notification gating, debugging
     setup/captain-b2-sync.sh         provision + teardown, the one-command equivalent
-    terraform/                       same stack as IaC, plus phone_home.sh
+    terraform/                       same stack as IaC
 ```
 
 ## Contributing

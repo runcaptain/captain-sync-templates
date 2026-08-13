@@ -2,7 +2,7 @@
 #
 # Template version (date-based, YYYY-MM-DD). Bump this when the template shape
 # changes and re-host it under a matching dated path, e.g.
-#   .../templates/2026-08-12/gcp/terraform
+#   .../templates/2026-08-13/gcp/terraform
 # Customer-facing object ids here are Stripe-style prefix_token (dep_..., sync_...),
 # never bare UUIDs.
 
@@ -21,5 +21,5 @@ terraform {
   }
 }
 
-# The phone-home (terraform_data + local-exec) shells out to enroll.sh, which
-# needs curl and jq on PATH. No extra provider is required for it.
+# The webhook registration (terraform_data + local-exec) shells out to
+# enroll.sh, which needs curl and jq on PATH. No extra provider is required.

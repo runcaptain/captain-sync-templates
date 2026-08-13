@@ -7,38 +7,44 @@
 #   1. Pub/Sub topic + let this project's GCS service agent publish to it.
 #   2. GCS object-change notification on your EXISTING bucket -> that topic.
 #   3. A dedicated push service account + a push subscription that delivers to
-#      Captain's ingest endpoint with a Google-signed OIDC token (no keys).
+#      your sync's Captain ingest URL with a Google-signed OIDC token (no keys).
 #   4. roles/storage.objectViewer for Captain's OWN service account on the bucket.
-#   5. A SELF-VERIFYING phone-home: it exits non-zero unless Captain confirms it
-#      can both read your objects and receive the push. A clean run is a
-#      CONFIRMED sync, not a hopeful one.
+#   5. A final ENROLLMENT call to the Captain API
+#      (POST /v2/syncs/<sync-id>/webhooks): it exits non-zero unless Captain
+#      answers 2xx with the sync's subscribe_url. A clean run means Captain has
+#      this webhook on file, not just that the GCP resources went green.
 #
 # Every step logs what it is doing and every id it creates. Re-running is safe:
 # existing resources are detected and reused (idempotent).
 #
 # Usage:
+#   export CAPTAIN_API_KEY=<your Captain API key>   # preferred over --api-key
 #   ./setup.sh \
 #     --project my-gcp-project \
 #     --bucket my-existing-bucket \
 #     --sync-id sync_abc123 \
-#     --external-id <min-8-chars> \
-#     --secret <min-16-chars> \
+#     --ingest-url <the subscribe_url Captain minted for this sync> \
 #     --reader-sa captain-reader@captain-prod.iam.gserviceaccount.com \
-#     [--ingest-url https://api.runcaptain.com/v1/deploy/gcp/gcs/ingest] \
-#     [--enroll-url https://api.runcaptain.com/v1/deploy/gcp/gcs/enroll] \
+#     [--api-key <key>] \
+#     [--api-base https://api.captain.dev] \
 #     [--oidc-audience <aud>] \
 #     [--event-types OBJECT_FINALIZE,OBJECT_DELETE,OBJECT_METADATA_UPDATE,OBJECT_ARCHIVE] \
 #     [--object-prefix ""] \
 #     [--dry-run]
+#
+# --ingest-url is the subscribe_url that POST /v2/syncs/<sync-id>/webhooks
+# returns; Captain pre-fills it when it generates this command for your sync.
+# There is no default: every sync gets its own minted URL. See
+# https://docs.captain.dev/guides/sync/set-up if you do not have yours.
 #
 # Captain normally generates this exact command for you per-sync with every
 # value pre-filled.
 # =============================================================================
 set -euo pipefail
 
-TEMPLATE_VERSION="2026-08-12"
+TEMPLATE_VERSION="2026-08-13"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENROLL_SH="${HERE}/../terraform/enroll.sh" # single source of truth for the phone-home
+ENROLL_SH="${HERE}/../terraform/enroll.sh" # single source of truth for the enrollment call
 
 # ---- logging -----------------------------------------------------------------
 log()   { printf '[captain-setup %s] %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; }
@@ -46,10 +52,11 @@ step()  { printf '\n[captain-setup %s] ==== %s ====\n' "$(date -u +%H:%M:%SZ)" "
 die()   { printf '[captain-setup %s] ERROR %s\n' "$(date -u +%H:%M:%SZ)" "$*" >&2; exit 1; }
 
 # ---- defaults / args ---------------------------------------------------------
-PROJECT_ID=""; BUCKET_NAME=""; SYNC_ID=""; EXTERNAL_ID=""; ENROLLMENT_SECRET=""
+PROJECT_ID=""; BUCKET_NAME=""; SYNC_ID=""
 CAPTAIN_READER_SA=""
-CAPTAIN_INGEST_URL="https://api.runcaptain.com/v1/deploy/gcp/gcs/ingest"
-CAPTAIN_ENROLL_URL="https://api.runcaptain.com/v1/deploy/gcp/gcs/enroll"
+CAPTAIN_INGEST_URL=""                                # required; no default (per-sync minted URL)
+CAPTAIN_API_BASE="https://api.captain.dev"           # override only for staging
+CAPTAIN_API_KEY="${CAPTAIN_API_KEY:-}"               # env preferred; --api-key accepted
 OIDC_AUDIENCE=""
 EVENT_TYPES="OBJECT_FINALIZE,OBJECT_DELETE,OBJECT_METADATA_UPDATE,OBJECT_ARCHIVE"
 OBJECT_PREFIX=""
@@ -60,11 +67,10 @@ while [ $# -gt 0 ]; do
     --project)        PROJECT_ID="$2"; shift 2 ;;
     --bucket)         BUCKET_NAME="$2"; shift 2 ;;
     --sync-id)        SYNC_ID="$2"; shift 2 ;;
-    --external-id)    EXTERNAL_ID="$2"; shift 2 ;;
-    --secret)         ENROLLMENT_SECRET="$2"; shift 2 ;;
     --reader-sa)      CAPTAIN_READER_SA="$2"; shift 2 ;;
     --ingest-url)     CAPTAIN_INGEST_URL="$2"; shift 2 ;;
-    --enroll-url)     CAPTAIN_ENROLL_URL="$2"; shift 2 ;;
+    --api-base)       CAPTAIN_API_BASE="$2"; shift 2 ;;
+    --api-key)        CAPTAIN_API_KEY="$2"; shift 2 ;;
     --oidc-audience)  OIDC_AUDIENCE="$2"; shift 2 ;;
     --event-types)    EVENT_TYPES="$2"; shift 2 ;;
     --object-prefix)  OBJECT_PREFIX="$2"; shift 2 ;;
@@ -86,24 +92,21 @@ step "Preflight checks"
 for bin in gcloud jq curl; do
   command -v "$bin" >/dev/null 2>&1 || die "$bin not found on PATH. Install it and re-run."
 done
-[ -f "$ENROLL_SH" ] || die "phone-home script not found at $ENROLL_SH (run this from the repo so the terraform/ sibling is present)."
+[ -f "$ENROLL_SH" ] || die "enrollment script not found at $ENROLL_SH (run this from the repo so the terraform/ sibling is present)."
 
 : "${PROJECT_ID:?--project is required}"
 : "${BUCKET_NAME:?--bucket is required}"
 : "${SYNC_ID:?--sync-id is required}"
-: "${EXTERNAL_ID:?--external-id is required}"
-: "${ENROLLMENT_SECRET:?--secret is required}"
 : "${CAPTAIN_READER_SA:?--reader-sa is required}"
+[ -n "$CAPTAIN_INGEST_URL" ] \
+  || die "--ingest-url is required. It is the subscribe_url Captain minted for this sync (Captain pre-fills it in your generated command; see https://docs.captain.dev/guides/sync/set-up)."
+[ -n "$CAPTAIN_API_KEY" ] \
+  || die "no Captain API key. Export CAPTAIN_API_KEY (preferred, keeps it out of shell history) or pass --api-key."
 
 echo "$SYNC_ID" | grep -Eq '^sync_[A-Za-z0-9]+$' || die "--sync-id must look like sync_<token>. Got: $SYNC_ID"
-[ "${#EXTERNAL_ID}" -ge 8 ] && [ "${#EXTERNAL_ID}" -le 1224 ] \
-  || die "--external-id must be between 8 and 1224 characters."
-echo "$EXTERNAL_ID" | grep -Eq '^[A-Za-z0-9._~-]+$' \
-  || die "--external-id must contain only letters, digits, and the characters . _ ~ - (it goes into a URL query string)."
-[ "${#ENROLLMENT_SECRET}" -ge 16 ] || die "--secret must be at least 16 characters."
 echo "$CAPTAIN_READER_SA" | grep -Eq '\.iam\.gserviceaccount\.com$' || die "--reader-sa must be a Google service account email."
 case "$CAPTAIN_INGEST_URL" in https://*) : ;; *) die "--ingest-url must be https://" ;; esac
-case "$CAPTAIN_ENROLL_URL" in https://*) : ;; *) die "--enroll-url must be https://" ;; esac
+case "$CAPTAIN_API_BASE" in https://*) : ;; *) die "--api-base must be https:// (refusing to send the API key over plaintext)" ;; esac
 
 ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -n1 || true)"
 [ -n "$ACTIVE_ACCOUNT" ] || die "no active gcloud credential. Run: gcloud auth login"
@@ -145,22 +148,6 @@ sha256_hex() {
 # alphabet. KEEP THIS IN SYNC with the identical function in teardown.sh.
 push_sa_id_for_sync() { printf 'cap-push-%s' "$(sha256_hex "$1" | cut -c1-16)"; }
 
-# urlencode: percent-encode everything outside RFC 3986 unreserved chars before
-# it goes into a query string. external_id is already charset-validated above,
-# but this makes the endpoint URL correct even if that validation is ever
-# loosened, and it costs nothing when the input is already URL-safe.
-urlencode() {
-  local s="$1" i c out=""
-  for (( i = 0; i < ${#s}; i++ )); do
-    c="${s:i:1}"
-    case "$c" in
-      [a-zA-Z0-9.~_-]) out+="$c" ;;
-      *) out+="$(printf '%%%02X' "'$c")" ;;
-    esac
-  done
-  printf '%s' "$out"
-}
-
 TOPIC="captain-gcs-sync-${SYNC_ID}"
 SUB="captain-gcs-push-${SYNC_ID}"
 PUSH_SA_ID="$(push_sa_id_for_sync "$SYNC_ID")"
@@ -171,7 +158,9 @@ SUB_FQN="projects/${PROJECT_ID}/subscriptions/${SUB}"
 GCS_AGENT="$(gcloud storage service-agent --project="$PROJECT_ID" 2>/dev/null || true)"
 [ -n "$GCS_AGENT" ] || die "could not resolve the GCS service agent for $PROJECT_ID (is the storage API enabled?)."
 PUBSUB_AGENT="service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com"
-PUSH_ENDPOINT="${CAPTAIN_INGEST_URL}?sync_id=$(urlencode "$SYNC_ID")&external_id=$(urlencode "$EXTERNAL_ID")"
+# The push endpoint is the minted subscribe_url exactly as Captain returned it.
+# Nothing is appended: the URL already identifies the sync.
+PUSH_ENDPOINT="$CAPTAIN_INGEST_URL"
 EFFECTIVE_AUDIENCE="${OIDC_AUDIENCE:-$CAPTAIN_INGEST_URL}"
 
 log "deploymentId=$DEPLOYMENT_ID topic=$TOPIC sub=$SUB pushSA=$PUSH_SA_EMAIL"
@@ -211,7 +200,8 @@ step "GCS notification on gs://${BUCKET_NAME}"
 # reason (permission denied, wrong bucket, a transient API error) that must
 # not be read as "no existing notification, go ahead and create one" -- it
 # could double up a notification the lookup just failed to see, or paper
-# over a permissions problem the phone-home would otherwise catch far later.
+# over a permissions problem the enrollment call would otherwise catch far
+# later.
 NOTIF_LIST_OUT="$(gcloud storage buckets notifications list "gs://${BUCKET_NAME}" --format=json 2>&1)" \
   && NOTIF_LIST_STATUS=0 || NOTIF_LIST_STATUS=$?
 [ "$NOTIF_LIST_STATUS" -eq 0 ] \
@@ -269,28 +259,19 @@ step "Grant Captain's reader SA objectViewer on the bucket"
 run gcloud storage buckets add-iam-policy-binding "gs://${BUCKET_NAME}" \
   --member="serviceAccount:${CAPTAIN_READER_SA}" --role="roles/storage.objectViewer"
 
-# ---- 5. self-verifying phone-home --------------------------------------------
-step "Phone home to Captain and verify (this is what makes the deploy confirmed)"
+# ---- 5. enroll the webhook with the Captain API -------------------------------
+step "Register the webhook with Captain (POST /v2/syncs/${SYNC_ID}/webhooks)"
 if [ "$DRY_RUN" = "1" ]; then
-  log "dry-run: skipping phone-home. Would POST enrollment for $DEPLOYMENT_ID to $CAPTAIN_ENROLL_URL"
+  log "dry-run: skipping enrollment. Would POST ${CAPTAIN_API_BASE%/}/v2/syncs/${SYNC_ID}/webhooks (Bearer auth, empty JSON body)"
 else
-  CAPTAIN_ENROLL_URL="$CAPTAIN_ENROLL_URL" \
-  ACTION="create" \
+  CAPTAIN_API_BASE="$CAPTAIN_API_BASE" \
+  SYNC_ID="$SYNC_ID" \
+  CAPTAIN_API_KEY="$CAPTAIN_API_KEY" \
+  INGEST_URL="$CAPTAIN_INGEST_URL" \
   DEPLOYMENT_ID="$DEPLOYMENT_ID" \
   TEMPLATE_VERSION="$TEMPLATE_VERSION" \
-  SYNC_ID="$SYNC_ID" \
-  EXTERNAL_ID="$EXTERNAL_ID" \
-  PROJECT_ID="$PROJECT_ID" \
-  BUCKET_NAME="$BUCKET_NAME" \
-  PUBSUB_TOPIC="$TOPIC_FQN" \
-  PUBSUB_SUBSCRIPTION="$SUB_FQN" \
-  PUSH_SERVICE_ACCOUNT="$PUSH_SA_EMAIL" \
-  READER_SERVICE_ACCOUNT="$CAPTAIN_READER_SA" \
-  INGEST_URL="$CAPTAIN_INGEST_URL" \
-  OIDC_AUDIENCE="$EFFECTIVE_AUDIENCE" \
-  ENROLLMENT_SECRET="$ENROLLMENT_SECRET" \
-    bash "$ENROLL_SH" create \
-    || die "phone-home did not verify. The plumbing was created but Captain has not confirmed it. See the error above, fix, then re-run this script (it is idempotent)."
+    bash "$ENROLL_SH" \
+    || die "webhook registration failed. The GCP plumbing was created but Captain has not confirmed the webhook. See the error above, fix, then re-run this script (it is idempotent)."
 fi
 
 # ---- done --------------------------------------------------------------------
@@ -298,32 +279,30 @@ step "Done"
 if [ "$DRY_RUN" = "1" ]; then
 cat >&2 <<EOF
 
-  Dry run only. Nothing was created and the phone-home was skipped, so this
-  sync is NOT verified. Re-run without --dry-run to actually deploy it.
+  Dry run only. Nothing was created and the enrollment call was skipped, so
+  this sync is NOT registered. Re-run without --dry-run to actually deploy it.
 
     deploymentId : $DEPLOYMENT_ID
 EOF
 else
 cat >&2 <<EOF
 
-  Captain GCS sync is live and VERIFIED.
+  Captain GCS sync is live and REGISTERED with the Captain API.
 
-    deploymentId : $DEPLOYMENT_ID
+    deploymentId : $DEPLOYMENT_ID   (local id, stamped on this run's logs)
     syncId       : $SYNC_ID
     bucket       : gs://$BUCKET_NAME
     topic        : $TOPIC_FQN
     subscription : $SUB_FQN
-    push SA      : $PUSH_SA_EMAIL   (Captain allowlists this OIDC subject)
+    push SA      : $PUSH_SA_EMAIL   (the OIDC identity on each push delivery)
     reader SA    : $CAPTAIN_READER_SA  => roles/storage.objectViewer
 
-  Next: open your Captain dashboard for $SYNC_ID. A targeted reconcile of
-  gs://$BUCKET_NAME runs automatically; future object changes push near-real-time.
+  Next: open your Captain dashboard for $SYNC_ID. Object changes push
+  near-real-time; the reconcile backstop covers anything push misses.
 
   To tear this down later (--push-sa is optional; teardown.sh re-derives it
-  from --sync-id if omitted, but --secret is required for an authenticated
-  teardown notice -- reuse the same secret you passed to --secret above):
-    ./teardown.sh --project $PROJECT_ID --bucket $BUCKET_NAME --sync-id $SYNC_ID \\
-      --secret <your enrollment secret> --reader-sa $CAPTAIN_READER_SA \\
-      --deployment-id $DEPLOYMENT_ID [--enroll-url $CAPTAIN_ENROLL_URL]
+  from --sync-id if omitted):
+    ./teardown.sh --project $PROJECT_ID --bucket $BUCKET_NAME \\
+      --sync-id $SYNC_ID --reader-sa $CAPTAIN_READER_SA
 EOF
 fi

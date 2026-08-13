@@ -5,22 +5,29 @@
 # Cloudflare has no "Launch Stack" button, so this script IS the one-click
 # equivalent. It:
 #   1. Preflights your tools and inputs (fails early with a clear message).
-#   2. Creates the events queue + dead-letter queue.
-#   3. Deploys the consumer Worker (queue drain + keyless read proxy).
-#   4. Sets the shared secret.
-#   5. Wires R2 event notifications on your bucket -> the queue.
-#   6. Phones home to Captain and FAILS LOUDLY unless Captain confirms
-#      enrollment (self-verifying: a green run means a confirmed sync).
+#   2. Subscribes this sync's webhook with Captain
+#      (POST {CAPTAIN_API_BASE}/v2/syncs/{SYNC_ID}/webhooks). Captain mints the
+#      per-sync subscribe_url the Worker will forward events to. A 2xx with a
+#      subscribe_url IS confirmed enrollment; anything else FAILS LOUDLY before
+#      any Cloudflare resource is created.
+#   3. Creates the events queue + dead-letter queue.
+#   4. Deploys the consumer Worker (queue drain + keyless read proxy), wired to
+#      the minted subscribe_url.
+#   5. Sets the shared secret.
+#   6. Wires R2 event notifications on your bucket -> the queue.
+#   7. Self-tests the event path end to end.
 #
 # Reconcile/polling is the always-on backstop; the queue path is the latency win.
 #
 # Usage:
 #   export CLOUDFLARE_ACCOUNT_ID=<your account id>   # `wrangler whoami`
-#   export SYNC_ID=sync_xxx                          # Captain gives you this
+#   export SYNC_ID=sync_xxx                          # your Captain sync id
 #   export BUCKET_NAME=<your-r2-bucket>
-#   export CAPTAIN_SECRET=<16+ char enrollment secret>   # Captain gives you this
+#   export CAPTAIN_API_KEY=<your Captain API key>    # authenticates the webhook subscribe
+#   export CAPTAIN_SECRET=<16+ char shared secret>   # you choose it; guards the Worker read proxy
 #   # optional overrides:
-#   export CAPTAIN_INGEST_URL=...  CAPTAIN_ENROLL_URL=...
+#   export CAPTAIN_API_BASE=https://api.captain.dev  # override for staging only
+#   export CAPTAIN_INGEST_URL=...  # reuse an already-minted subscribe_url (skips the subscribe call)
 #   export WORKER_NAME=captain-r2-sync  QUEUE_NAME=captain-r2-sync
 #   export PREFIX=docs/            # only watch keys under this prefix
 #   export DEBUG=true             # verbose Worker logs
@@ -39,8 +46,11 @@ WORKER_DIR="$HERE/worker"
 WORKER_NAME="${WORKER_NAME:-captain-r2-sync}"
 QUEUE_NAME="${QUEUE_NAME:-captain-r2-sync}"
 DLQ_NAME="${QUEUE_NAME}-dlq"
-CAPTAIN_INGEST_URL="${CAPTAIN_INGEST_URL:-https://api.runcaptain.com/v1/deploy/r2/ingest}"
-CAPTAIN_ENROLL_URL="${CAPTAIN_ENROLL_URL:-https://api.runcaptain.com/v1/deploy/r2/enroll}"
+CAPTAIN_API_BASE="${CAPTAIN_API_BASE:-https://api.captain.dev}"
+# CAPTAIN_INGEST_URL has NO default on purpose: it is the per-sync subscribe_url
+# Captain mints in step 2 below. Setting it up front only makes sense to reuse a
+# subscribe_url from an earlier run.
+CAPTAIN_INGEST_URL="${CAPTAIN_INGEST_URL:-}"
 PREFIX="${PREFIX:-}"
 DEBUG="${DEBUG:-false}"
 
@@ -56,7 +66,8 @@ command -v curl >/dev/null    || die "curl is not installed."
 : "${CLOUDFLARE_ACCOUNT_ID:?Set CLOUDFLARE_ACCOUNT_ID (see \`wrangler whoami\`).}"
 : "${SYNC_ID:?Set SYNC_ID (sync_... from Captain).}"
 : "${BUCKET_NAME:?Set BUCKET_NAME (your existing R2 bucket).}"
-: "${CAPTAIN_SECRET:?Set CAPTAIN_SECRET (16+ char enrollment secret from Captain).}"
+: "${CAPTAIN_API_KEY:?Set CAPTAIN_API_KEY (your Captain API key; authenticates the webhook subscribe).}"
+: "${CAPTAIN_SECRET:?Set CAPTAIN_SECRET (16+ char shared secret YOU choose; it guards the Worker read proxy).}"
 
 [[ "$SYNC_ID" =~ ^sync_[A-Za-z0-9]+$ ]] || die "SYNC_ID must look like sync_<token>, got: $SYNC_ID"
 [[ "${#CAPTAIN_SECRET}" -ge 16 ]]        || die "CAPTAIN_SECRET must be at least 16 characters."
@@ -69,7 +80,61 @@ log "Installing Worker dependencies..."
 ( cd "$WORKER_DIR" && npm install --no-audit --no-fund >/dev/null 2>&1 ) || die "npm install failed in $WORKER_DIR"
 
 # =============================================================================
-# 2. GENERATE a per-sync wrangler config from the committed template
+# 2. ENROLL: subscribe this sync's webhook with Captain
+# -----------------------------------------------------------------------------
+# POST {CAPTAIN_API_BASE}/v2/syncs/{SYNC_ID}/webhooks with a Bearer API key and
+# an empty JSON body. Captain answers 2xx with the per-sync subscribe_url it
+# minted; that URL becomes CAPTAIN_INGEST_URL, the target the Worker forwards
+# events to. A 2xx with a subscribe_url IS successful enrollment. Runs BEFORE
+# any Cloudflare resource is touched so a bad sync id or API key fails early.
+# =============================================================================
+if [[ -n "$CAPTAIN_INGEST_URL" ]]; then
+  log "CAPTAIN_INGEST_URL provided; reusing the already-minted subscribe_url and skipping the subscribe call."
+else
+  SUBSCRIBE_ENDPOINT="$CAPTAIN_API_BASE/v2/syncs/$SYNC_ID/webhooks"
+  log "Subscribing sync $SYNC_ID with Captain: POST $SUBSCRIBE_ENDPOINT ..."
+  SUB_STATUS="000"
+  SUB_BODY=""
+  for attempt in 1 2 3; do
+    RESP="$(curl -sS -w '\n%{http_code}' -X POST "$SUBSCRIBE_ENDPOINT" \
+              -H "Authorization: Bearer $CAPTAIN_API_KEY" \
+              -H "content-type: application/json" \
+              -d '{}' 2>/dev/null || true)"
+    SUB_STATUS="$(printf '%s\n' "$RESP" | tail -n1)"
+    SUB_BODY="$(printf '%s\n' "$RESP" | sed '$d')"
+    if [[ "$SUB_STATUS" == "000" || "$SUB_STATUS" =~ ^5 ]] && [[ "$attempt" -lt 3 ]]; then
+      warn "Subscribe attempt $attempt/3 got HTTP $SUB_STATUS; retrying in 2s..."
+      sleep 2
+      continue
+    fi
+    break
+  done
+
+  if [[ "$SUB_STATUS" == "000" ]]; then
+    die "Could not reach Captain at $SUBSCRIBE_ENDPOINT (connection failed). Check CAPTAIN_API_BASE and your network, then re-run."
+  fi
+  if [[ ! "$SUB_STATUS" =~ ^2 ]]; then
+    echo "$SUB_BODY" | jq . 2>/dev/null || echo "$SUB_BODY"
+    die "Captain returned HTTP $SUB_STATUS for the webhook subscribe (body printed above). Check SYNC_ID and CAPTAIN_API_KEY, then re-run. Nothing was created yet."
+  fi
+
+  CAPTAIN_INGEST_URL="$(printf '%s' "$SUB_BODY" | jq -r '.subscribe_url // empty' 2>/dev/null || true)"
+  if [[ -z "$CAPTAIN_INGEST_URL" ]]; then
+    echo "$SUB_BODY" | jq . 2>/dev/null || echo "$SUB_BODY"
+    die "Captain returned HTTP $SUB_STATUS but no subscribe_url in the body (printed above). Cannot wire the Worker without it."
+  fi
+
+  log "Enrolled. Captain minted subscribe_url: $CAPTAIN_INGEST_URL"
+  SECRET_SET="$(printf '%s' "$SUB_BODY" | jq -r '.secret_set // false' 2>/dev/null || echo false)"
+  if [[ "$SECRET_SET" != "true" ]]; then
+    warn "Captain reports secret_set=false for this sync's webhook. Events still flow; set the webhook secret on your Captain sync if you want signed deliveries."
+  fi
+  # Captain may include next-step instructions in the response; show them.
+  printf '%s' "$SUB_BODY" | jq -r '.instructions[]? | "  - \(.)"' 2>/dev/null || true
+fi
+
+# =============================================================================
+# 3. GENERATE a per-sync wrangler config from the committed template
 # =============================================================================
 GEN="$WORKER_DIR/wrangler.generated.jsonc"
 log "Generating $GEN for sync $SYNC_ID ..."
@@ -80,8 +145,7 @@ sed \
   -e "s|captain-r2-sync-dlq|$DLQ_NAME|g" \
   -e "s|\"queue\": \"captain-r2-sync\"|\"queue\": \"$QUEUE_NAME\"|g" \
   -e "s|\"ACCOUNT_ID\": \"\"|\"ACCOUNT_ID\": \"$CLOUDFLARE_ACCOUNT_ID\"|" \
-  -e "s|https://api.runcaptain.com/v1/deploy/r2/ingest|$CAPTAIN_INGEST_URL|" \
-  -e "s|https://api.runcaptain.com/v1/deploy/r2/enroll|$CAPTAIN_ENROLL_URL|" \
+  -e "s|\"CAPTAIN_INGEST_URL\": \"\"|\"CAPTAIN_INGEST_URL\": \"$CAPTAIN_INGEST_URL\"|" \
   -e "s|\"DEBUG\": \"false\"|\"DEBUG\": \"$DEBUG\"|" \
   "$WORKER_DIR/wrangler.jsonc" > "$GEN"
 
@@ -122,7 +186,7 @@ run_step() {
 }
 
 # =============================================================================
-# 3. QUEUES (idempotent)
+# 4. QUEUES (idempotent)
 # =============================================================================
 log "Creating queue $QUEUE_NAME (ok if it already exists)..."
 run_step "Creating queue $QUEUE_NAME" "already exists|already taken" WR queues create "$QUEUE_NAME"
@@ -130,7 +194,7 @@ log "Creating dead-letter queue $DLQ_NAME (ok if it already exists)..."
 run_step "Creating dead-letter queue $DLQ_NAME" "already exists|already taken" WR queues create "$DLQ_NAME"
 
 # =============================================================================
-# 4. DEPLOY the Worker + set the secret
+# 5. DEPLOY the Worker + set the secret
 # =============================================================================
 log "Deploying Worker $WORKER_NAME ..."
 DEPLOY_OUT="$(WR deploy 2>&1)" || { echo "$DEPLOY_OUT"; die "wrangler deploy failed."; }
@@ -142,7 +206,7 @@ log "Setting CAPTAIN_SECRET..."
 printf '%s' "$CAPTAIN_SECRET" | WR secret put CAPTAIN_SECRET >/dev/null 2>&1 || die "Failed to set CAPTAIN_SECRET."
 
 # =============================================================================
-# 5. R2 EVENT NOTIFICATIONS -> queue
+# 6. R2 EVENT NOTIFICATIONS -> queue
 # =============================================================================
 log "Wiring R2 event notifications on $BUCKET_NAME -> $QUEUE_NAME ..."
 NOTIF_ARGS=(r2 bucket notification create "$BUCKET_NAME" --queue "$QUEUE_NAME" --event-types object-create object-delete)
@@ -154,15 +218,13 @@ run_step "Wiring R2 event notifications on $BUCKET_NAME" "already exists|already
 log "Step 7 below self-tests real event delivery in your account; scheduled reconcile is the backstop either way."
 
 # =============================================================================
-# 6. PHONE HOME (self-verify): fail loudly unless Captain confirms
+# 7. VERIFY the read proxy + self-test the event path
 # =============================================================================
 if [[ -n "$WORKER_URL" ]]; then
   # A Worker secret update is not instantly global: `wrangler secret put` in
-  # step 4 can leave some edge PoPs still serving the old (or no) secret for a
+  # step 5 can leave some edge PoPs still serving the old (or no) secret for a
   # few seconds. Poll an authorized route with the new secret, bounded to
-  # ~15s, before trusting a 401 on enroll to mean something other than
-  # propagation lag. This is a best-effort head start, not a guarantee: the
-  # enroll call below still retries on 401 for the same reason.
+  # ~15s, so Captain's first read-proxy call does not hit propagation lag.
   log "Waiting for CAPTAIN_SECRET to be live at the edge (up to 15s)..."
   SECRET_LIVE=false
   DEADLINE=$((SECONDS + 15))
@@ -176,56 +238,20 @@ if [[ -n "$WORKER_URL" ]]; then
     sleep 1
   done
   if [[ "$SECRET_LIVE" == "true" ]]; then
-    log "CAPTAIN_SECRET confirmed live."
+    log "CAPTAIN_SECRET confirmed live; the read proxy answers with it."
   else
-    warn "CAPTAIN_SECRET still not reading back as live after 15s; proceeding, the enroll call below retries on 401 too."
+    warn "CAPTAIN_SECRET still not reading back as live after 15s; usually just propagation lag. Re-probe with: curl $WORKER_URL/__captain/objects?limit=1 -H 'Authorization: Bearer \$CAPTAIN_SECRET'"
   fi
 
-  log "Phoning home to Captain via $WORKER_URL/__captain/enroll ..."
-  ENROLL_STATUS="000"
-  ENROLL_BODY=""
-  for attempt in 1 2 3 4; do
-    RESP="$(curl -sS -w '\n%{http_code}' -X POST "$WORKER_URL/__captain/enroll" \
-              -H "Authorization: Bearer $CAPTAIN_SECRET" 2>/dev/null || true)"
-    ENROLL_STATUS="$(printf '%s\n' "$RESP" | tail -n1)"
-    ENROLL_BODY="$(printf '%s\n' "$RESP" | sed '$d')"
-    if [[ "$ENROLL_STATUS" == "401" && "$attempt" -lt 4 ]]; then
-      warn "Enroll got 401 on attempt $attempt/4, likely secret-propagation lag; retrying in 2s..."
-      sleep 2
-      continue
-    fi
-    break
-  done
-
-  if [[ "$ENROLL_STATUS" == "000" ]]; then
-    die "Enroll call could not reach $WORKER_URL/__captain/enroll (connection failed). The Worker may be unreachable. Check \`wrangler tail\`."
-  fi
-
-  # Never swallow the body: this is what the README's debugging table
-  # promises gets printed on a failed phone-home.
-  echo "$ENROLL_BODY" | jq . 2>/dev/null || echo "$ENROLL_BODY"
-  VERIFIED="$(printf '%s' "$ENROLL_BODY" | jq -r '.verified // false' 2>/dev/null || echo false)"
-  DEP_ID="$(printf '%s' "$ENROLL_BODY" | jq -r '.deploymentId // "dep_unknown"' 2>/dev/null || echo dep_unknown)"
-
-  if [[ "$VERIFIED" != "true" ]]; then
-    die "Captain did NOT confirm enrollment. HTTP $ENROLL_STATUS, verified=$VERIFIED, deployment $DEP_ID (body printed above). Fix the reported issue and re-run. Nothing was rolled back; re-running is safe (idempotent)."
-  fi
-  log "Verified. Deployment $DEP_ID is live and confirmed (HTTP $ENROLL_STATUS)."
-else
-  warn "Skipping phone-home: no Worker URL. Enable the workers.dev subdomain, then run: curl -X POST <worker-url>/__captain/enroll -H 'Authorization: Bearer \$CAPTAIN_SECRET'"
-fi
-
-# =============================================================================
-# 7. OPTIONAL self-test of the event path
-# =============================================================================
-if [[ -n "$WORKER_URL" ]]; then
   log "Self-testing the R2 -> Queue -> Worker event path (writes + deletes a canary)..."
   ST="$(curl -sS -X POST "$WORKER_URL/__captain/selftest" -H "Authorization: Bearer $CAPTAIN_SECRET" 2>/dev/null || true)"
   echo "$ST" | jq . 2>/dev/null || echo "$ST"
   log "Watch: run \`cd worker && npx wrangler tail -c wrangler.generated.jsonc\` and look for a queue batch with the canary key within ~30s."
+else
+  warn "No workers.dev URL was parsed from the deploy output. Enable the workers.dev subdomain in the dashboard so Captain can reach the read proxy, then re-run ./deploy.sh (idempotent)."
 fi
 
-log "Done. What to do next:"
+log "Done. Sync $SYNC_ID is enrolled; the Worker forwards events to Captain's minted subscribe_url."
 echo "  - Open your Captain dashboard for sync $SYNC_ID; a reconcile of $BUCKET_NAME runs now."
 echo "  - Future object changes sync near-real-time via the queue."
 echo "  - Debug logs: cd worker && npx wrangler tail -c wrangler.generated.jsonc"

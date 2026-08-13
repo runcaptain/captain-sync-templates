@@ -11,17 +11,17 @@ Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: "Captain enrollment (pre-filled by Captain, confirm before launch)" }
-        Parameters: [CaptainCallbackUrl, CaptainAccountId, SyncId, ExternalId, Secret]
+        Parameters: [CaptainApiBase, CaptainAccountId, SyncId, ExternalId, CaptainApiKey]
       - Label: { default: "Your bucket" }
         Parameters: [BucketName, ObjectPrefix, KmsKeyArn]
       - Label: { default: "Advanced" }
         Parameters: [DebugLogging]
     ParameterLabels:
-      CaptainCallbackUrl: { default: "Captain callback URL" }
+      CaptainApiBase: { default: "Captain API base URL" }
       CaptainAccountId: { default: "Captain AWS account id" }
       SyncId: { default: "Captain sync id" }
       ExternalId: { default: "External id (confused-deputy guard)" }
-      Secret: { default: "Enrollment secret (write-only)" }
+      CaptainApiKey: { default: "Captain API key (write-only)" }
       BucketName: { default: "S3 bucket to sync" }
       ObjectPrefix: { default: "Key prefix to scope the sync (optional)" }
       KmsKeyArn: { default: "KMS key ARN if the bucket is SSE-KMS encrypted (optional)" }
@@ -32,39 +32,42 @@ Description: >
   Captain needs to keep an S3 collection synced near-real-time, entirely inside the
   CUSTOMER'S AWS account: an SNS topic fed by the bucket's ObjectCreated/ObjectRemoved
   events, a read-only cross-account IAM role Captain assumes (no long-lived keys), and
-  a self-verifying custom resource that phones home to Captain so enrollment either
-  completes and is confirmed, or fails visibly in Stack Events and rolls back.
+  a self-verifying custom resource that registers the topic with the Captain API so
+  enrollment either completes and is confirmed, or fails visibly in Stack Events
+  and rolls back.
 
 # ---------------------------------------------------------------------------
 # DEBUGGABLE-DEPLOY DESIGN (read this before editing)
 #
 # The problem with "click Launch Stack and hope": if anything is misconfigured
-# (wrong account id, an SNS policy that blocks S3, a role Captain cannot assume),
-# the customer gets a green CloudFormation stack and a sync that silently never
-# works. There is no feedback loop.
+# (wrong account id, an SNS policy that blocks S3, a topic Captain cannot
+# subscribe to), the customer gets a green CloudFormation stack and a sync that
+# silently never works. There is no feedback loop.
 #
-# This template closes the loop with a PHONE-HOME custom resource:
+# This template closes the loop with an ENROLL custom resource that calls the
+# real Captain webhook-registration API:
 #
 #   1. CloudFormation creates the SNS topic, the topic policy, and the read role.
 #   2. The bucket's notification config is pointed at the topic (see the
 #      BUCKET NOTIFICATION CONSTRAINT block below for why this is a custom
 #      resource and not a native property on a pre-existing bucket).
-#   3. The EnrollWithCaptain custom resource POSTs every fact Captain needs
-#      (stackId, region, bucket, prefix, snsTopicArn, roleArn, externalId,
-#      syncId, secret, deploymentId) to CaptainCallbackUrl. Captain then:
-#        - subscribes its own endpoint to the SNS topic,
-#        - assumes the read role with the external id (proving the trust +
-#          policy actually work),
-#        - runs a verification handshake, and
-#        - returns 2xx with {"verified": true} only if all of that succeeded.
-#   4. If the callback is non-2xx, times out, or errors, the custom resource
-#      sends FAILED to CloudFormation with a human-readable Reason. That turns
-#      into a red line in Stack Events and rolls the stack back. The customer
-#      sees the failure at deploy time, not three days later when documents
-#      are stale.
+#   3. The EnrollWithCaptain custom resource POSTs to
+#        {CaptainApiBase}/v2/syncs/{SyncId}/webhooks
+#      with "Authorization: Bearer {CaptainApiKey}" and the body
+#        {"sns_topic_arn": "<the topic this stack just created>"}
+#      (sns_topic_arn is required for S3-family syncs; the API returns 422
+#      without it). On success Captain subscribes to the topic and returns
+#      2xx JSON with subscribe_url (the per-sync ingest URL Captain minted),
+#      secret_set, and instructions. A 2xx with a subscribe_url IS successful
+#      enrollment: Captain subscribing to the topic is the verification.
+#   4. If the call is non-2xx, times out, errors, or comes back without a
+#      subscribe_url, the custom resource sends FAILED to CloudFormation with
+#      a human-readable Reason. That turns into a red line in Stack Events and
+#      rolls the stack back. The customer sees the failure at deploy time, not
+#      three days later when documents are stale.
 #
 # So the deploy is self-verifying: a SUCCEEDED stack means Captain has
-# confirmed, end to end, that it can both receive events and read objects.
+# accepted the topic registration and minted the sync's subscribe_url.
 #
 # Every Lambda in here logs heavily to CloudWatch (single-line, structured,
 # secret-redacted), answers CloudFormation on EVERY path (so the stack never
@@ -74,17 +77,16 @@ Description: >
 
 Parameters:
 
-  CaptainCallbackUrl:
+  CaptainApiBase:
     Type: String
-    # PLACEHOLDER: confirm this is the live Captain prod enroll endpoint before
-    # publishing the hosted template. Captain normally pre-fills it per-sync.
-    Default: "https://api.runcaptain.com/v1/deploy/aws/s3/enroll"
+    Default: "https://api.captain.dev"
     AllowedPattern: "^https://.*"
-    ConstraintDescription: Must be an https:// URL (the custom resource refuses to send the secret over plaintext).
+    ConstraintDescription: Must be an https:// URL (the custom resource refuses to send the API key over plaintext).
     Description: >
-      Captain enrollment endpoint the phone-home custom resource POSTs to on
-      create/update/delete. PLACEHOLDER default shown; Captain fills this in when
-      it generates your Launch Stack link. Must be https.
+      Base URL of the Captain API. The enroll custom resource POSTs to
+      {CaptainApiBase}/v2/syncs/{SyncId}/webhooks on create/update. Leave the
+      production default unless Captain support points you at a staging
+      environment. Must be https.
 
   CaptainAccountId:
     Type: String
@@ -146,14 +148,15 @@ Parameters:
       longest of those names (captain-s3-setnotif-<SyncId>).
     Description: The Captain sync id (sync_<token>) this deployment enrolls. Captain fills this in.
 
-  Secret:
+  CaptainApiKey:
     Type: String
     NoEcho: true
-    MinLength: 16
+    MinLength: 8
     Description: >
-      One-time enrollment secret minted by Captain for this sync. Sent to
-      CaptainCallbackUrl so Captain can bind this deployment to your sync. Write-only
-      (NoEcho); never surfaced in Outputs or logs (the Lambda redacts it).
+      Your Captain API key. Sent as an "Authorization: Bearer" header to the
+      Captain API so the webhook registration runs against your account.
+      Write-only (NoEcho); never surfaced in Outputs or logs (the Lambda
+      redacts it).
 
   DebugLogging:
     Type: String
@@ -175,7 +178,7 @@ Resources:
   # =========================================================================
 
   # The topic Captain subscribes to. S3 publishes object-change events here; the
-  # phone-home hands Captain this topic's ARN so it can subscribe its endpoint.
+  # enroll resource registers this topic's ARN with Captain so it can subscribe.
   CaptainSyncTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -188,7 +191,7 @@ Resources:
   # Topic policy: (a) let THIS bucket publish (SourceArn + SourceAccount pin it
   # so no other account's bucket can publish), and (b) let Captain's account
   # subscribe its endpoint to the topic (so Captain, not just the console user,
-  # can complete the subscription during the handshake).
+  # can complete the subscription during enrollment).
   CaptainSyncTopicPolicy:
     Type: AWS::SNS::TopicPolicy
     Properties:
@@ -557,7 +560,7 @@ Resources:
         - { Key: captain:managed-by, Value: cloudformation }
 
   # =========================================================================
-  # 3. SELF-VERIFYING CUSTOM RESOURCE (phone home + handshake)
+  # 3. SELF-VERIFYING CUSTOM RESOURCE (webhook registration with Captain)
   # =========================================================================
 
   # Plain stack-owned log group; same two rules as
@@ -605,17 +608,18 @@ Resources:
           CAPTAIN_DEBUG: !Ref DebugLogging
       Code:
         ZipFile: |
-          # Phone-home custom resource. POSTs the enrollment facts to Captain and
-          # ALWAYS answers CloudFormation, so a failed handshake shows up in Stack
-          # Events and rolls the stack back instead of hanging for an hour.
+          # Enroll custom resource. Registers the stack's SNS topic with the
+          # Captain API (POST {CaptainApiBase}/v2/syncs/{SyncId}/webhooks) and
+          # ALWAYS answers CloudFormation, so a failed registration shows up in
+          # Stack Events and rolls the stack back instead of hanging for an hour.
           #
           # Heavy, structured, single-line logging under the CAPTAIN-ENROLL prefix.
-          # The one-time Secret is NEVER logged (it is redacted to its length).
+          # The Captain API key is NEVER logged (it is redacted to its length).
           import json, os, secrets, string, urllib.request, urllib.error
 
           DEBUG = os.environ.get("CAPTAIN_DEBUG", "true").lower() == "true"
           ALPHABET = string.ascii_letters + string.digits
-          REDACT = ("secret",)
+          REDACT = ("apiKey", "authorization")
 
           def log(tag, **kw):
               if not DEBUG and tag.endswith("-debug"):
@@ -652,16 +656,20 @@ Resources:
               except Exception as e:
                   log("cfn-respond-FAILED", error=str(e))
 
-          def phone_home(url, payload):
-              data = json.dumps(payload).encode()
-              log("phone-home-post", url=url, bytes=len(data),
-                  deploymentId=payload.get("deploymentId"),
-                  syncId=payload.get("syncId"), bucket=payload.get("bucket"),
-                  region=payload.get("region"), action=payload.get("action"),
-                  secret=payload.get("secret"))
+          def register_webhook(api_base, api_key, sync_id, topic_arn):
+              # The real Captain contract: POST /v2/syncs/{sync_id}/webhooks with
+              # a bearer API key. sns_topic_arn is REQUIRED for S3-family syncs
+              # (the API returns 422 without it). Success is 2xx JSON carrying
+              # subscribe_url (the per-sync ingest URL Captain minted),
+              # secret_set, and instructions.
+              url = "%s/v2/syncs/%s/webhooks" % (api_base.rstrip("/"), sync_id)
+              data = json.dumps({"sns_topic_arn": topic_arn}).encode()
+              log("webhook-post", url=url, syncId=sync_id, snsTopicArn=topic_arn,
+                  apiKey=api_key)
               req = urllib.request.Request(
                   url, data=data, method="POST",
                   headers={"content-type": "application/json",
+                           "authorization": "Bearer %s" % api_key,
                            "user-agent": "captain-cfn-enroll/2026-08-13"})
               # Raises on non-2xx (HTTPError) or timeout/DNS (URLError); caller
               # converts either into a CloudFormation FAILED with a clear reason.
@@ -672,19 +680,22 @@ Resources:
                       parsed = json.loads(raw)
                   except Exception:
                       parsed = {"raw": raw[:512]}
-                  log("phone-home-response", httpStatus=status, body=parsed)
+                  if not isinstance(parsed, dict):
+                      parsed = {"raw": str(parsed)[:512]}
+                  log("webhook-response", httpStatus=status,
+                      subscribeUrl=parsed.get("subscribe_url"),
+                      secretSet=parsed.get("secret_set"))
                   return status, parsed
 
           def preflight(props):
               # Human-readable validation before we touch anything. Returned
               # problems become the CloudFormation failure Reason verbatim.
               problems = []
-              url = props.get("CaptainCallbackUrl") or ""
-              if not url.startswith("https://"):
+              base = props.get("CaptainApiBase") or ""
+              if not base.startswith("https://"):
                   problems.append(
-                      "CaptainCallbackUrl must be https:// (got %r)" % url[:48])
-              for key in ("BucketName", "SnsTopicArn", "RoleArn",
-                          "ExternalId", "SyncId", "Secret"):
+                      "CaptainApiBase must be https:// (got %r)" % base[:48])
+              for key in ("SnsTopicArn", "SyncId", "CaptainApiKey"):
                   if not props.get(key):
                       problems.append("missing required property: %s" % key)
               return problems
@@ -700,54 +711,41 @@ Resources:
                   stackId=evt.get("StackId"),
                   logStream=getattr(ctx, "log_stream_name", None))
               try:
-                  if rtype != "Delete":
-                      problems = preflight(props)
-                      if problems:
-                          reason = "Preflight failed: " + "; ".join(problems)
-                          log("preflight-failed", problems=problems)
-                          cfn_respond(evt, ctx, "FAILED", reason,
-                                      {"deploymentId": dep_id})
-                          return
-                  base = {
-                      "deploymentId": dep_id,
-                      "templateVersion": "2026-08-13",
-                      "action": rtype.lower(),
-                      "stackId": evt.get("StackId"),
-                      "partition": props.get("Partition"),
-                      "region": props.get("Region"),
-                      "bucket": props.get("BucketName"),
-                      "objectPrefix": props.get("ObjectPrefix") or "",
-                      "kmsKeyArn": props.get("KmsKeyArn") or "",
-                      "snsTopicArn": props.get("SnsTopicArn"),
-                      "roleArn": props.get("RoleArn"),
-                      "externalId": props.get("ExternalId"),
-                      "syncId": props.get("SyncId"),
-                      "secret": props.get("Secret"),
-                  }
-                  url = props.get("CaptainCallbackUrl")
                   if rtype == "Delete":
-                      # Best-effort teardown notice; never block a stack delete.
-                      try:
-                          phone_home(url, {**base, "action": "delete"})
-                      except Exception as e:
-                          log("teardown-notice-failed-tolerated", error=str(e))
+                      # No Captain call on teardown: there is no documented
+                      # unsubscribe endpoint, and none is needed. Deleting the
+                      # stack removes the SNS topic; Captain detects the dead
+                      # event source and reconcile remains the backstop.
                       cfn_respond(evt, ctx, "SUCCESS",
-                                  "teardown notice sent", {"deploymentId": dep_id})
+                                  "stack teardown; Captain detects the removed topic",
+                                  {"deploymentId": dep_id})
                       return
-                  # Create / Update: the handshake MUST succeed or we fail visibly.
-                  status, resp = phone_home(url, base)
-                  ok = isinstance(resp, dict) and resp.get("verified") is True
-                  if 200 <= status < 300 and ok:
-                      log("verified", captainStatus=resp.get("status"))
+                  problems = preflight(props)
+                  if problems:
+                      reason = "Preflight failed: " + "; ".join(problems)
+                      log("preflight-failed", problems=problems)
+                      cfn_respond(evt, ctx, "FAILED", reason,
+                                  {"deploymentId": dep_id})
+                      return
+                  # Create / Update: the registration MUST succeed or we fail
+                  # visibly. A 2xx with a subscribe_url IS successful enrollment:
+                  # Captain subscribing to the topic is the verification.
+                  status, resp = register_webhook(
+                      props.get("CaptainApiBase"), props.get("CaptainApiKey"),
+                      props.get("SyncId"), props.get("SnsTopicArn"))
+                  subscribe_url = resp.get("subscribe_url")
+                  if 200 <= status < 300 and subscribe_url:
+                      log("enrolled", subscribeUrl=subscribe_url,
+                          secretSet=resp.get("secret_set"))
                       cfn_respond(evt, ctx, "SUCCESS",
-                                  "Captain verified enrollment",
+                                  "Captain accepted the webhook registration",
                                   {"deploymentId": dep_id,
-                                   "captainStatus": resp.get("status", "verified")})
+                                   "subscribeUrl": subscribe_url,
+                                   "secretSet": str(bool(resp.get("secret_set")))})
                   else:
-                      reason = ("Captain did not confirm enrollment "
-                                "(http %s, verified=%s). Response: %s"
-                                % (status, ok, json.dumps(resp)[:400]))
-                      log("not-verified", httpStatus=status, verified=ok)
+                      reason = ("Captain returned HTTP %s without a subscribe_url. "
+                                "Response: %s" % (status, json.dumps(resp)[:400]))
+                      log("not-enrolled", httpStatus=status)
                       cfn_respond(evt, ctx, "FAILED", reason,
                                   {"deploymentId": dep_id})
               except urllib.error.HTTPError as e:
@@ -758,7 +756,7 @@ Resources:
                       pass
                   log("http-error", code=e.code, detail=detail)
                   cfn_respond(evt, ctx, "FAILED",
-                              "Captain callback returned HTTP %s: %s" % (e.code, detail),
+                              "Captain API returned HTTP %s: %s" % (e.code, detail),
                               {"deploymentId": dep_id})
               except Exception as e:
                   log("unhandled-error", error=str(e))
@@ -769,36 +767,35 @@ Resources:
                                   {"deploymentId": dep_id})
                   else:
                       cfn_respond(evt, ctx, "FAILED",
-                                  "Could not reach Captain callback: %s" % e,
+                                  "Could not reach the Captain API: %s" % e,
                                   {"deploymentId": dep_id})
 
-  # Run the phone-home LAST: only enroll once the topic, policy, notification, and
-  # read role all exist, so Captain's handshake tests real, finished plumbing.
+  # Run the enrollment LAST: only register the webhook once the topic, policy,
+  # notification, and read role all exist, so Captain subscribes to real,
+  # finished plumbing.
   EnrollWithCaptain:
     Type: Custom::EnrollWithCaptain
-    # RoleArn below is a GetAtt on CaptainReadRole, so that dependency is already
-    # implicit; we only need to name the resources this one does NOT reference.
+    # The registration call itself only needs the topic, but enrollment is the
+    # stack's final gate, so it waits for everything, including the read role
+    # (no longer referenced in Properties, hence listed here).
     DependsOn:
       - CaptainSyncTopicPolicy
       - SetBucketNotification
+      - CaptainReadRole
     Properties:
       ServiceToken: !GetAtt EnrollFunction.Arn
-      CaptainCallbackUrl: !Ref CaptainCallbackUrl
-      Partition: !Ref AWS::Partition
-      Region: !Ref AWS::Region
-      BucketName: !Ref BucketName
-      ObjectPrefix: !Ref ObjectPrefix
-      KmsKeyArn: !Ref KmsKeyArn
-      SnsTopicArn: !Ref CaptainSyncTopic
-      RoleArn: !GetAtt CaptainReadRole.Arn
-      ExternalId: !Ref ExternalId
+      CaptainApiBase: !Ref CaptainApiBase
+      CaptainApiKey: !Ref CaptainApiKey
       SyncId: !Ref SyncId
-      Secret: !Ref Secret
+      SnsTopicArn: !Ref CaptainSyncTopic
 
 Outputs:
   DeploymentId:
-    Description: Stripe-style deployment id (dep_<token>) generated during the phone-home. Use it to look up deployment state in Captain.
+    Description: Stripe-style deployment id (dep_<token>) generated during enrollment. Share it with Captain support to identify this deploy attempt.
     Value: !GetAtt EnrollWithCaptain.deploymentId
+  SubscribeUrl:
+    Description: Per-sync ingest URL Captain minted when it accepted the webhook registration.
+    Value: !GetAtt EnrollWithCaptain.subscribeUrl
   SnsTopicArn:
     Description: SNS topic the bucket publishes change events to; Captain subscribes here.
     Value: !Ref CaptainSyncTopic
@@ -823,6 +820,8 @@ Outputs:
   WhatToDoNext:
     Description: One-line next step.
     Value: !Sub >-
-      Deployment ${EnrollWithCaptain.deploymentId} is enrolled and verified. Open your
-      Captain dashboard for sync ${SyncId}; a targeted reconcile of ${BucketName} runs
-      automatically and future object changes sync near-real-time.
+      Deployment ${EnrollWithCaptain.deploymentId} is enrolled: Captain subscribed to
+      your topic and minted ${EnrollWithCaptain.subscribeUrl}. Open your Captain
+      dashboard for sync ${SyncId}; object changes in ${BucketName} now sync
+      near-real-time, with reconcile as the backstop. Guide:
+      https://docs.captain.dev/guides/sync/set-up

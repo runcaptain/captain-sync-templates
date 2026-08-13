@@ -1,5 +1,5 @@
 locals {
-  template_version = "2026-08-12"
+  template_version = "2026-08-13"
 
   # Stripe-style deployment id: dep_<token>. No bare UUIDs.
   deployment_id = "dep_${random_string.dep.result}"
@@ -8,12 +8,34 @@ locals {
   s3_endpoint = data.b2_account_info.this.s3_api_url
   s3_region   = try(regex("^https://s3\\.([a-z0-9-]+)\\.backblazeb2\\.com", local.s3_endpoint)[0], "unknown")
 
-  # Default the events webhook to the enroll host's /events path, sync-tagged.
-  events_url = var.events_url != "" ? var.events_url : "https://api.runcaptain.com/v1/deploy/b2/events?sync=${var.sync_id}"
+  # The B2 rule targets the per-sync subscribe URL Captain mints at enrollment.
+  subscribe_url = data.external.captain_webhook.result.subscribe_url
 
   # B2-safe resource name fragments (letters/digits/'-' only, lowercased rule).
   key_name  = "captain-b2-read-${replace(var.sync_id, "_", "-")}"
   rule_name = lower("captain-sync-${replace(var.sync_id, "_", "-")}")
+}
+
+# =========================================================================
+# ENROLLMENT: mint the per-sync subscribe URL from Captain's API
+#
+# POST {api_base}/v2/syncs/<sync_id>/webhooks with a Bearer API key and an
+# empty JSON body (B2 is not an SNS-backed source, so no sns_topic_arn).
+# Captain answering 2xx with a subscribe_url IS the enrollment; anything else
+# fails the plan/apply with a clear reason. The call is idempotent per sync
+# (Captain returns the sync's subscribe URL), so re-running plan/apply is safe.
+#
+# The API key comes ONLY from the CAPTAIN_API_KEY environment variable, so it
+# never lands in the plan or in state. See enroll_webhook.sh.
+# =========================================================================
+data "external" "captain_webhook" {
+  program = ["/usr/bin/env", "bash", "${path.module}/enroll_webhook.sh"]
+
+  query = {
+    sync_id          = var.sync_id
+    api_base         = var.api_base
+    template_version = local.template_version
+  }
 }
 
 # Discover the account's S3 endpoint + region (works in any B2 region).
@@ -77,83 +99,13 @@ resource "b2_bucket_notification_rules" "captain" {
 
     target_configuration {
       target_type                = "webhook"
-      url                        = local.events_url
+      url                        = local.subscribe_url
       hmac_sha256_signing_secret = random_password.hmac.result
     }
   }
 }
 
-# =========================================================================
-# SELF-VERIFYING PHONE-HOME
-#
-# Runs after the key (and rule, if any) exist. phone_home.sh POSTs the
-# enrollment facts to Captain and exits non-zero unless Captain returns
-# {"verified": true}. A non-zero exit fails `terraform apply`, so a clean apply
-# means Captain confirmed it can read the bucket end to end.
-#
-# Rollback difference vs the setup script: on a failed verify Terraform leaves
-# the key/rule in state (it does not auto-destroy them). Re-run apply after
-# fixing the cause, or `terraform destroy` to tear the deployment down. The
-# setup script rolls back automatically; that is the one behavioral gap.
-# =========================================================================
-resource "null_resource" "enroll" {
-  depends_on = [
-    b2_application_key.captain_read,
-    b2_bucket_notification_rules.captain,
-  ]
-
-  triggers = {
-    deployment_id    = local.deployment_id
-    sync_id          = var.sync_id
-    bucket_id        = data.b2_bucket.target.bucket_id
-    read_key_id      = b2_application_key.captain_read.application_key_id
-    event_status     = var.event_path == "enabled" ? "enabled" : "skipped"
-    template_version = local.template_version
-    callback_url     = var.callback_url
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/usr/bin/env", "bash", "${path.module}/phone_home.sh"]
-    command     = "create"
-
-    environment = {
-      CAPTAIN_CALLBACK_URL     = var.callback_url
-      CAPTAIN_ACTION           = "create"
-      CAPTAIN_DEPLOYMENT_ID    = local.deployment_id
-      CAPTAIN_TEMPLATE_VERSION = local.template_version
-      CAPTAIN_SYNC_ID          = var.sync_id
-      CAPTAIN_SECRET           = var.secret
-      CAPTAIN_ACCOUNT_ID       = data.b2_account_info.this.account_id
-      CAPTAIN_BUCKET_NAME      = var.bucket_name
-      CAPTAIN_BUCKET_ID        = data.b2_bucket.target.bucket_id
-      CAPTAIN_S3_ENDPOINT      = local.s3_endpoint
-      CAPTAIN_S3_REGION        = local.s3_region
-      CAPTAIN_READ_KEY_ID      = b2_application_key.captain_read.application_key_id
-      CAPTAIN_READ_APP_KEY     = b2_application_key.captain_read.application_key
-      CAPTAIN_EVENTS_URL       = local.events_url
-      CAPTAIN_EVENT_STATUS     = var.event_path == "enabled" ? "enabled" : "skipped"
-      CAPTAIN_RULE_NAME        = local.rule_name
-      CAPTAIN_HMAC_SECRET      = random_password.hmac.result
-    }
-  }
-
-  # Best-effort teardown notice. Destroy provisioners can reference only self,
-  # so it uses self.triggers (no secret); Captain identifies by dep + sync id.
-  provisioner "local-exec" {
-    when        = destroy
-    on_failure  = continue
-    interpreter = ["/usr/bin/env", "bash", "${path.module}/phone_home.sh"]
-    command     = "delete"
-
-    environment = {
-      CAPTAIN_CALLBACK_URL     = self.triggers.callback_url
-      CAPTAIN_ACTION           = "delete"
-      CAPTAIN_DEPLOYMENT_ID    = self.triggers.deployment_id
-      CAPTAIN_TEMPLATE_VERSION = self.triggers.template_version
-      CAPTAIN_SYNC_ID          = self.triggers.sync_id
-      CAPTAIN_BUCKET_ID        = self.triggers.bucket_id
-      CAPTAIN_READ_KEY_ID      = self.triggers.read_key_id
-      CAPTAIN_EVENT_STATUS     = "removed"
-    }
-  }
-}
+# No teardown call to Captain on destroy: there is no unsubscribe endpoint.
+# `terraform destroy` removes the B2-side resources; Captain detects the dead
+# event source on its own and the scheduled reconcile backstop keeps the sync
+# consistent until you pause or delete it in Captain.

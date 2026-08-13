@@ -9,15 +9,21 @@ project_id  = "your-gcp-project"
 bucket_name = "your-existing-gcs-bucket"
 
 # Captain fills these in when it generates your deploy command.
+# captain_ingest_url is the subscribe_url that POST /v2/syncs/<sync_id>/webhooks
+# returns: the per-sync ingest URL your push subscription delivers to. There is
+# no default; see https://docs.captain.dev/guides/sync/set-up if you need yours.
 sync_id                        = "sync_REPLACE_ME"
-enrollment_secret              = "REPLACE_WITH_16PLUS_CHAR_ENROLL_SECRET"
-external_id                    = "REPLACE_WITH_8PLUS_CHAR_EXTERNAL_ID"
+captain_ingest_url             = "https://REPLACE_WITH_THE_SUBSCRIBE_URL_CAPTAIN_MINTED"
 captain_reader_service_account = "captain-reader@captain-prod.iam.gserviceaccount.com"
 
-# Optional. Defaults shown; Captain overrides them per-sync when needed.
-# captain_ingest_url = "https://api.runcaptain.com/v1/deploy/gcp/gcs/ingest"
-# captain_enroll_url = "https://api.runcaptain.com/v1/deploy/gcp/gcs/enroll"
-# oidc_audience      = ""        # empty = use captain_ingest_url as the audience
+# Your Captain API key (Bearer auth on the webhook-registration call). Prefer
+# the environment over writing it into this file:
+#   export TF_VAR_captain_api_key="<your key>"
+# captain_api_key = "REPLACE_OR_USE_TF_VAR_captain_api_key"
+
+# Optional. Defaults shown; override only if Captain gave you a staging base.
+# captain_api_base = "https://api.captain.dev"
+# oidc_audience    = ""        # empty = use captain_ingest_url as the audience
 
 # Optional wiring knobs.
 # event_types        = ["OBJECT_FINALIZE", "OBJECT_DELETE", "OBJECT_METADATA_UPDATE", "OBJECT_ARCHIVE"]

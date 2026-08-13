@@ -19,18 +19,20 @@ variable "aws_region" {
   }
 }
 
-variable "captain_callback_url" {
+variable "captain_api_base" {
   type        = string
   description = <<-EOT
-    Captain enrollment endpoint the phone-home Lambda POSTs to on
-    create/update/destroy. Captain fills this in when it generates your tfvars.
-    Must be https:// (the Lambda refuses to send the secret over plaintext).
+    Base URL of the Captain API. The enroll Lambda POSTs to
+    {captain_api_base}/v2/syncs/{sync_id}/webhooks on create/update. Leave the
+    production default unless Captain support points you at a staging
+    environment. Must be https:// (the Lambda refuses to send the API key over
+    plaintext).
   EOT
-  default     = "https://api.runcaptain.com/v1/deploy/aws/s3/enroll"
+  default     = "https://api.captain.dev"
 
   validation {
-    condition     = startswith(var.captain_callback_url, "https://")
-    error_message = "captain_callback_url must be an https:// URL."
+    condition     = startswith(var.captain_api_base, "https://")
+    error_message = "captain_api_base must be an https:// URL."
   }
 }
 
@@ -124,18 +126,18 @@ variable "sync_id" {
   }
 }
 
-variable "secret" {
+variable "captain_api_key" {
   type        = string
   sensitive   = true
   description = <<-EOT
-    One-time enrollment secret minted by Captain for this sync. Sent to
-    captain_callback_url so Captain can bind this deployment to your sync.
+    Your Captain API key. Sent as an "Authorization: Bearer" header to the
+    Captain API so the webhook registration runs against your account.
     Marked sensitive; never printed in plan/apply output and redacted in logs.
   EOT
 
   validation {
-    condition     = length(var.secret) >= 16
-    error_message = "secret must be at least 16 characters."
+    condition     = var.captain_api_key == null ? true : length(var.captain_api_key) >= 8
+    error_message = "captain_api_key must be at least 8 characters."
   }
 }
 

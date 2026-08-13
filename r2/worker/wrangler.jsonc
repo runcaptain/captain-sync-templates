@@ -4,8 +4,10 @@
   // ---------------------------------------------------------------------------
   // This is the ONE-CLICK-equivalent path for Cloudflare. Cloudflare has no
   // "Launch Stack" button like AWS CloudFormation, so the closest equivalent is
-  // `npx wrangler deploy` from this directory, driven by ../deploy.sh which fills
-  // in the per-sync values and runs the self-verifying phone-home for you.
+  // `npx wrangler deploy` from this directory, driven by ../deploy.sh which
+  // subscribes the sync webhook with Captain (POST
+  // {CAPTAIN_API_BASE}/v2/syncs/{SYNC_ID}/webhooks) and fills in the per-sync
+  // values, including the subscribe_url Captain mints (CAPTAIN_INGEST_URL).
   //
   // Values written as $CAPTAIN_* or <placeholder> are filled in by ../deploy.sh
   // (or by Captain when it generates your deploy command). The two things you
@@ -60,13 +62,16 @@
 
   // Plaintext vars (safe to show). deploy.sh overrides these per sync.
   // CAPTAIN_SECRET is NOT here: it is a secret, set via `wrangler secret put`.
+  // CAPTAIN_INGEST_URL has NO default on purpose: it is the per-sync
+  // subscribe_url Captain mints when deploy.sh calls
+  // POST {CAPTAIN_API_BASE}/v2/syncs/{SYNC_ID}/webhooks, so it cannot be
+  // known ahead of time. deploy.sh fills it in.
   "vars": {
-    "TEMPLATE_VERSION": "2026-08-12",
+    "TEMPLATE_VERSION": "2026-08-13",
     "SYNC_ID": "sync_replaceme",
     "BUCKET_NAME": "replace-with-your-bucket",
     "ACCOUNT_ID": "",
-    "CAPTAIN_INGEST_URL": "https://api.runcaptain.com/v1/deploy/r2/ingest",
-    "CAPTAIN_ENROLL_URL": "https://api.runcaptain.com/v1/deploy/r2/enroll",
+    "CAPTAIN_INGEST_URL": "",
     "DEBUG": "false"
   }
 }

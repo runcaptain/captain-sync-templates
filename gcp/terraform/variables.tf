@@ -35,33 +35,14 @@ variable "sync_id" {
   }
 }
 
-variable "enrollment_secret" {
+variable "captain_api_key" {
   type        = string
   sensitive   = true
-  description = "One-time enrollment secret minted by Captain for this sync. POSTed to the enroll endpoint so Captain can bind this deployment to your sync. Sensitive; never printed to outputs."
+  description = "Your Captain API key. Sent as 'Authorization: Bearer <key>' on the webhook-registration call (POST /v2/syncs/<sync_id>/webhooks) and nowhere else. Sensitive; never printed to outputs. Prefer TF_VAR_captain_api_key over writing it into terraform.tfvars."
 
   validation {
-    condition     = length(var.enrollment_secret) >= 16
-    error_message = "enrollment_secret must be at least 16 characters. Captain mints this for you; do not shorten or invent one."
-  }
-}
-
-variable "external_id" {
-  type        = string
-  description = "Per-sync external id (confused-deputy guard). Echoed to Captain during enrollment and carried, URL-encoded, on the push endpoint so Captain can bind incoming events to the right sync. Captain fills this in."
-
-  validation {
-    condition     = length(var.external_id) >= 8 && length(var.external_id) <= 1224
-    error_message = "external_id must be between 8 and 1224 characters."
-  }
-
-  validation {
-    # Restrict to RFC 3986 unreserved characters. This is belt and suspenders
-    # with the urlencode() call on push_endpoint in main.tf: even if a future
-    # external_id somehow skipped encoding, it still could not inject a query
-    # param or corrupt the push endpoint URL.
-    condition     = can(regex("^[A-Za-z0-9._~-]+$", var.external_id))
-    error_message = "external_id must contain only letters, digits, and the characters . _ ~ - (URL-safe, no encoding required)."
+    condition     = length(var.captain_api_key) > 0
+    error_message = "captain_api_key must be set. Mint one in your Captain dashboard; see https://docs.captain.dev/guides/sync/set-up."
   }
 }
 
@@ -77,23 +58,22 @@ variable "captain_reader_service_account" {
 
 variable "captain_ingest_url" {
   type        = string
-  description = "Captain's Pub/Sub push ingest endpoint. The push subscription delivers object-change events here, authenticated with a Google-signed OIDC token. PLACEHOLDER default shown; Captain fills this in when it generates your deploy link. Must be https."
-  default     = "https://api.runcaptain.com/v1/deploy/gcp/gcs/ingest"
+  description = "The per-sync ingest URL the push subscription delivers to: the subscribe_url that POST /v2/syncs/<sync_id>/webhooks returns. Captain pre-fills it when it generates your tfvars; there is NO default because every sync gets its own minted URL. See https://docs.captain.dev/guides/sync/set-up. Must be https."
 
   validation {
     condition     = can(regex("^https://", var.captain_ingest_url))
-    error_message = "captain_ingest_url must be an https:// URL. Pub/Sub push with OIDC refuses plaintext, and so does Captain."
+    error_message = "captain_ingest_url must be an https:// URL. It is the subscribe_url Captain minted for this sync; Pub/Sub push with OIDC refuses plaintext, and so does Captain."
   }
 }
 
-variable "captain_enroll_url" {
+variable "captain_api_base" {
   type        = string
-  description = "Captain's enrollment endpoint. The self-verifying phone-home POSTs the deployment facts here on apply/destroy; Captain runs its read + delivery handshake and returns verified:true only if both pass. PLACEHOLDER default shown. Must be https."
-  default     = "https://api.runcaptain.com/v1/deploy/gcp/gcs/enroll"
+  description = "Base URL of the Captain API the webhook-registration call goes to. Leave the default (https://api.captain.dev) unless Captain gave you a staging base. Must be https."
+  default     = "https://api.captain.dev"
 
   validation {
-    condition     = can(regex("^https://", var.captain_enroll_url))
-    error_message = "captain_enroll_url must be an https:// URL (the phone-home refuses to send the secret over plaintext)."
+    condition     = can(regex("^https://", var.captain_api_base))
+    error_message = "captain_api_base must be an https:// URL (the registration call refuses to send the API key over plaintext)."
   }
 }
 

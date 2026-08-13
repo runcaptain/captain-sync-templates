@@ -1,25 +1,29 @@
-# Copy to terraform.tfvars and fill in. Values marked "Captain fills this in" come
-# from the deploy command Captain generates for your sync.
+# Copy to terraform.tfvars and fill in.
 
 # --- Cloudflare auth (you provide) ---
 # Prefer the CLOUDFLARE_API_TOKEN env var over putting the token in a file.
 # cloudflare_api_token = "your-cloudflare-api-token"
 
 account_id  = "0000000000000000000000000000abcd" # 32 hex chars, from `wrangler whoami`
-bucket_name = "my-r2-bucket"                       # the EXISTING bucket to sync
+bucket_name = "my-r2-bucket"                     # the EXISTING bucket to sync
 
 # Optional: your workers.dev subdomain, enables the keyless read proxy URL.
 # workers_subdomain = "my-team"
 
-# --- Captain enrollment (Captain fills this in) ---
-sync_id        = "sync_replaceme"
-captain_secret = "replace-with-the-16+char-enrollment-secret"
+# --- Captain (from your Captain account) ---
+# sync_id: the sync this stack wires up. captain_api_key: your Captain API key;
+# the apply uses it to call POST {captain_api_base}/v2/syncs/{sync_id}/webhooks,
+# and Captain mints the subscribe_url the Worker forwards events to.
+sync_id         = "sync_replaceme"
+captain_api_key = "replace-with-your-captain-api-key"
 
-# Defaults below are fine unless Captain tells you otherwise.
-# captain_ingest_url = "https://api.runcaptain.com/v1/deploy/r2/ingest"
-# captain_enroll_url = "https://api.runcaptain.com/v1/deploy/r2/enroll"
+# --- Shared secret (you choose it) ---
+# 16+ characters. Guards the Worker's /__captain/* read-proxy routes; configure
+# the same value on your Captain sync so Captain can read through the proxy.
+captain_secret = "replace-with-a-16+char-secret-you-choose"
 
 # --- Optional knobs ---
+# captain_api_base    = "https://api.captain.dev" # override for staging only
 # prefix              = "docs/"     # only fire events under this key prefix
 # jurisdiction        = "default"   # default | eu | fedramp
 # read_token_ttl_days = 90          # 0 = token never expires

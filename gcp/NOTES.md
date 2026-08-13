@@ -1,9 +1,10 @@
 # Engineering notes: gcp/ (Captain GCS sync)
 
 Two paths: Terraform (`terraform/`) and a shell script (`gcloud/setup.sh`
-plus `gcloud/teardown.sh`). Enrollment verification is not yet activated on
-the Captain backend, so a real end-to-end run reaches the phone-home step
-and fails there by design; everything up to that step is exercisable today.
+plus `gcloud/teardown.sh`). Both end with a webhook-registration call to the
+real Captain API (`POST /v2/syncs/{sync_id}/webhooks`); everything is
+exercisable end to end with a sync id, an API key, and the minted
+`subscribe_url` from Captain.
 
 ## Design choices
 
@@ -11,13 +12,34 @@ and fails there by design; everything up to that step is exercisable today.
   key.** The GCP analog of the S3 assume-role. The customer only IAM-binds
   `captain_reader_service_account` (objectViewer, one bucket); Captain
   authenticates as itself from its own project, so no key material ever
-  leaves the customer account. The confused-deputy guard that ExternalId
-  provides on AWS is carried by `external_id` on the push endpoint and in
-  the enroll payload; Captain must bind it to the sync.
+  leaves the customer account.
 - **Push auth is OIDC, not a shared secret in the URL.** Pub/Sub mints a
   Google-signed token as a dedicated push service account in the customer
-  project; Captain verifies it. The one-time `enrollment_secret` is only
-  for the enroll handshake, never for per-event auth.
+  project. The Captain API key is only for the one registration call,
+  never for per-event auth.
+- **The push endpoint is the minted `subscribe_url`, verbatim.** Captain's
+  webhook-registration endpoint mints a per-sync ingest URL; the template
+  appends nothing to it (no query params), because the URL already
+  identifies the sync. `--ingest-url` / `captain_ingest_url` therefore has
+  NO default and is required: there is no shared ingest URL to fall back
+  to. enroll.sh re-registers on every run and warns when the returned
+  `subscribe_url` differs from the configured one.
+- **API key stays out of logs and history.** `setup.sh` prefers the
+  `CAPTAIN_API_KEY` env var over `--api-key`; Terraform marks
+  `captain_api_key` sensitive and the tfvars example points at
+  `TF_VAR_captain_api_key`. enroll.sh sends the key only in the
+  Authorization header and never prints it (its debug logging prints the
+  response body, which contains no secret). curl reads that header from a
+  file in a private mktemp dir (`-H @file`, curl >= 7.55) rather than from
+  argv, so the key is also invisible to `ps`, and the curl stderr capture
+  lives in the same per-run dir instead of a fixed /tmp path two
+  concurrent runs would share.
+- **No teardown phone-home.** Captain documents no unsubscribe endpoint, so
+  teardown does not invent one: `teardown.sh` and `terraform destroy` only
+  remove the cloud-side resources. Captain detects the dead event source
+  and the reconcile backstop keeps the sync consistent. (An earlier build
+  round invented its own enroll/teardown endpoints; do not reintroduce any
+  endpoint that is not in the contract section below, in code or docs.)
 - **Additive notification.** GCS buckets allow multiple notification
   configs, so there is no S3-style single-slot clobber problem. Teardown
   removes only ours.
@@ -26,11 +48,9 @@ and fails there by design; everything up to that step is exercisable today.
   limit), so re-runs of `setup.sh` reuse the same SA instead of orphaning a
   fresh one each time, and `teardown.sh` can derive the same id when
   `--push-sa` is omitted.
-- **`external_id` and `sync_id` are charset-validated and URL-encoded.**
-  Both are validated against RFC 3986 unreserved characters
-  (`^[A-Za-z0-9._~-]+$`) and percent-encoded when building
-  `push_endpoint`. Either measure alone prevents URL injection; both are in
-  place.
+- **`sync_id` is charset-validated.** Both paths validate
+  `^sync_[A-Za-z0-9]+$` before it is interpolated into the API path
+  (`/v2/syncs/{sync_id}/webhooks`), so it cannot inject path segments.
 - **Notification matching is exact, not substring.** Both scripts find our
   notification by parsing `gcloud storage buckets notifications list
   --format=json` with `jq` and matching `endswith("/topics/<TOPIC>")` on
@@ -52,10 +72,6 @@ and fails there by design; everything up to that step is exercisable today.
   The list calls run during a dry run too (listing what exists is how the
   script decides what a real run would delete), so real failures can and
   do happen under `--dry-run`.
-- **Teardown's delete notice is authenticated or skipped.** `teardown.sh`
-  takes `--secret`; when supplied, the delete notice authenticates the same
-  way the Terraform destroy path does. When omitted, the script skips the
-  notice entirely (logged) rather than send a placeholder secret.
 - **Random-id generation guards against SIGPIPE.** `rand()` wraps its
   `tr -dc ... < /dev/urandom | head -c N` pipeline so a benign SIGPIPE
   cannot abort the script: `head -c` closes the pipe once it has enough
@@ -69,30 +85,30 @@ and fails there by design; everything up to that step is exercisable today.
 - **`.terraform.lock.hcl` is committed**, matching the sibling modules; it
   pins provider versions and is not a secret or local state.
 
-## Captain backend contract
+## Captain API contract (real, verified against the production MCP client)
 
-The phone-home expects:
+The only Captain call these templates make:
 
-1. **Enroll receiver** (placeholder
-   `https://api.runcaptain.com/v1/deploy/gcp/gcs/enroll`) accepting
-   `{deploymentId, templateVersion, action, provider, storage, syncId,
-   externalId, projectId, bucket, pubsubTopic, pubsubSubscription,
-   pushServiceAccount, readerServiceAccount, ingestUrl, oidcAudience,
-   secret}`. It must authenticate `secret` against `syncId` and return
-   `2xx` with `{"verified": true, ...}`; anything else fails the run.
-2. **A real verification handshake**: list/get on the bucket as
-   `readerServiceAccount` to prove the objectViewer grant propagated, and
-   allowlist `pushServiceAccount` as an accepted OIDC subject on
-   `ingestUrl` for `oidcAudience`.
-3. **An ingest endpoint** that verifies the Google-signed OIDC bearer token
-   (audience, issuer accounts.google.com, subject equals the enrolled push
-   SA), maps the delivery to a sync via the `sync_id`/`external_id` query
-   params, and returns 2xx quickly so Pub/Sub does not redeliver.
-4. **Per-deployment state** keyed by the `dep_<token>` id, for the README's
-   debugging pointer.
-5. **Delete handling**: teardown POSTs `{action: "delete", ...}`
-   best-effort, so the backend should reconcile orphaned
-   subscriptions and bindings.
+1. **Webhook registration**:
+   `POST {CAPTAIN_API_BASE}/v2/syncs/{sync_id}/webhooks` with
+   `Authorization: Bearer {CAPTAIN_API_KEY}`. `CAPTAIN_API_BASE` defaults
+   to `https://api.captain.dev` and stays overridable
+   (`--api-base` / `captain_api_base`) for staging.
+2. **Body**: `{}` for GCS. Only S3-family syncs send
+   `{"sns_topic_arn": "..."}` (the API answers 422 without it there); GCS
+   has no required body fields.
+3. **Success**: any 2xx JSON response carrying `subscribe_url` (the
+   per-sync ingest URL Captain minted), plus `secret_set` (bool) and
+   `instructions` (array of strings). 2xx + `subscribe_url` IS a
+   successful enrollment; enroll.sh requires both and logs the rest.
+4. **Failure**: non-2xx fails the run (only 5xx and network errors are
+   retried). 401/403 means the API key, 404 means the sync id.
+5. **No unsubscribe endpoint.** Teardown makes no API call; reconcile is
+   the backstop for orphaned wiring.
+
+`deployment_id` (`dep_<token>`) is purely local: a Stripe-style correlation
+id stamped on the run's logs and outputs. Captain does not key any state by
+it.
 
 ## Testing changes
 
@@ -105,11 +121,12 @@ ordering mistakes; those need the scripts actually run.
 Without a GCP project you can still exercise the real scripts' control
 flow by putting a mock `gcloud` first on `PATH` that answers only the
 subcommands the script calls and fails loudly on anything unrecognized,
-plus a local mock enroll endpoint for the phone-home
-(`terraform/enroll.sh` should exit 0 on `verified:true`, exit 1 with a
-readable reason on `verified:false` or a 4xx, and exit 0 on the delete
-action so teardown is never blocked). Check exit codes, not just the final
-log line.
+plus a local mock of `POST /v2/syncs/{sync_id}/webhooks` for the
+registration call (`terraform/enroll.sh` should exit 0 on a 2xx body with
+a `subscribe_url`, exit 1 with a readable reason on a 4xx or a 2xx body
+missing `subscribe_url`, and print the mismatch WARNING when `INGEST_URL`
+differs from the returned `subscribe_url`). Check exit codes, not just the
+final log line.
 
 For a live test, use a throwaway project and bucket with a principal
 holding the roles listed in the README, and verify at least:

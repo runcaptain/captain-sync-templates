@@ -11,9 +11,11 @@
 #                         backstop reads objects with it via the S3 API), PLUS the
 #                         same Worker's keyless read-proxy routes as the no-key
 #                         alternative.
-#   3. SELF-VERIFY        a phone-home to Captain (data.http.enroll) whose
-#                         postcondition FAILS THE APPLY unless Captain confirms it
-#                         can both receive events and read objects.
+#   3. ENROLLMENT         an apply-time call to Captain's real webhook API
+#                         (POST {captain_api_base}/v2/syncs/{sync_id}/webhooks,
+#                         data.http.subscribe). Captain mints the per-sync
+#                         subscribe_url the Worker forwards events to; a non-2xx
+#                         or a missing subscribe_url FAILS THE APPLY.
 #
 # Reconcile/polling is the always-on backstop; the Queue path is the latency win.
 #
@@ -27,7 +29,7 @@ provider "cloudflare" {
 }
 
 locals {
-  template_version   = "2026-08-12"
+  template_version   = "2026-08-13"
   worker_bundle_path = "${path.module}/../worker/dist/index.js"
   deployment_id      = "dep_${random_string.dep.result}"
 
@@ -37,7 +39,8 @@ locals {
   bucket_resource = "com.cloudflare.edge.r2.bucket.${var.account_id}_${var.jurisdiction}_${var.bucket_name}"
 
   # Public URL for the Worker's keyless read proxy, only if the account's
-  # workers.dev subdomain was supplied. Empty string means "enroll without it".
+  # workers.dev subdomain was supplied. Empty string means no public read-proxy
+  # URL (Captain reads via the scoped token instead).
   worker_url = var.workers_subdomain != "" ? "https://${var.worker_name}.${var.workers_subdomain}.workers.dev" : ""
 
   # R2 event-notification actions. Creates/overwrites -> upsert; deletes -> delete.
@@ -45,7 +48,7 @@ locals {
 }
 
 # Stripe-style deployment id (dep_<token>). Stored in state, stable across
-# applies, so the enrollment stays bound to one deployment. No bare UUIDs.
+# applies. A local reference id for support and audit trails. No bare UUIDs.
 resource "random_string" "dep" {
   length  = 24
   special = false
@@ -57,6 +60,48 @@ resource "random_string" "dep" {
 # Pin the read-token creation time in state so expires_on does not drift on every
 # apply (which a raw timestamp() would cause).
 resource "time_static" "read_token_created" {}
+
+# =============================================================================
+# 0. ENROLLMENT: subscribe this sync's webhook with Captain
+# -----------------------------------------------------------------------------
+# POST {captain_api_base}/v2/syncs/{sync_id}/webhooks, Bearer Captain API key,
+# empty JSON body (R2 needs no sns_topic_arn; that field is for AWS S3 syncs).
+# Captain answers 2xx with the subscribe_url it minted, plus secret_set and
+# instructions. That subscribe_url IS the Worker's CAPTAIN_INGEST_URL: there is
+# no default anywhere because the URL is minted per sync by this call. The
+# postcondition fails the apply unless the response carries a subscribe_url.
+# =============================================================================
+
+data "http" "subscribe" {
+  url    = "${var.captain_api_base}/v2/syncs/${var.sync_id}/webhooks"
+  method = "POST"
+
+  request_headers = {
+    "authorization" = "Bearer ${var.captain_api_key}"
+    "content-type"  = "application/json"
+    "user-agent"    = "captain-r2-terraform/${local.template_version}"
+  }
+
+  request_body = jsonencode({})
+
+  retry {
+    attempts     = 3
+    min_delay_ms = 2000
+    max_delay_ms = 10000
+  }
+
+  lifecycle {
+    postcondition {
+      condition     = self.status_code >= 200 && self.status_code < 300 && try(jsondecode(self.response_body).subscribe_url, "") != ""
+      error_message = "Captain did not confirm the webhook subscription. HTTP ${self.status_code}. Body: ${substr(self.response_body, 0, 400)}. Check sync_id and captain_api_key, then re-apply."
+    }
+  }
+}
+
+locals {
+  # The per-sync ingest URL Captain minted. Baked into the Worker below.
+  captain_ingest_url = try(jsondecode(data.http.subscribe.response_body).subscribe_url, "")
+}
 
 # =============================================================================
 # 1. EVENT WIRING: queues + Worker + notification
@@ -93,8 +138,7 @@ resource "cloudflare_workers_script" "consumer" {
     { type = "plain_text", name = "SYNC_ID", text = var.sync_id },
     { type = "plain_text", name = "BUCKET_NAME", text = var.bucket_name },
     { type = "plain_text", name = "ACCOUNT_ID", text = var.account_id },
-    { type = "plain_text", name = "CAPTAIN_INGEST_URL", text = var.captain_ingest_url },
-    { type = "plain_text", name = "CAPTAIN_ENROLL_URL", text = var.captain_enroll_url },
+    { type = "plain_text", name = "CAPTAIN_INGEST_URL", text = local.captain_ingest_url },
     { type = "plain_text", name = "DEBUG", text = var.debug ? "true" : "false" },
     { type = "secret_text", name = "CAPTAIN_SECRET", text = var.captain_secret },
   ]
@@ -195,57 +239,13 @@ resource "cloudflare_api_token" "read" {
 }
 
 # =============================================================================
-# 3. SELF-VERIFYING PHONE-HOME
+# 3. AFTER THE APPLY
 # -----------------------------------------------------------------------------
-# depends_on forces this read to run at APPLY time, after every resource above
-# exists, so Captain's handshake tests real, finished plumbing. The postcondition
-# turns a non-2xx or verified!=true response into a failed apply with a clear
-# message, instead of a green apply and a silently broken sync.
+# Enrollment already happened in data.http.subscribe above (a 2xx with a minted
+# subscribe_url is confirmed enrollment). The scoped read credentials do NOT
+# travel to Captain automatically: feed them into your Captain R2 sync yourself
+# (`tofu output -raw read_access_key_id` / `read_secret_access_key`, see the
+# README). There is no unsubscribe call on destroy either: Captain detects the
+# dead event source once the queue and Worker are gone, and scheduled reconcile
+# continues as the backstop.
 # =============================================================================
-
-data "http" "enroll" {
-  url    = var.captain_enroll_url
-  method = "POST"
-
-  request_headers = {
-    "content-type" = "application/json"
-    "user-agent"   = "captain-r2-terraform/${local.template_version}"
-  }
-
-  request_body = jsonencode({
-    deploymentId    = local.deployment_id
-    templateVersion = local.template_version
-    action          = "create"
-    source          = "r2"
-    accountId       = var.account_id
-    bucket          = var.bucket_name
-    syncId          = var.sync_id
-    jurisdiction    = var.jurisdiction
-    queueName       = cloudflare_queue.main.queue_name
-    workerUrl       = local.worker_url
-    readStrategy    = "scoped-token"
-    readAccessKeyId = cloudflare_api_token.read.id
-    readSecretKey   = sha256(cloudflare_api_token.read.value)
-    ingestUrl       = var.captain_ingest_url
-    secret          = var.captain_secret
-  })
-
-  retry {
-    attempts     = 3
-    min_delay_ms = 2000
-    max_delay_ms = 10000
-  }
-
-  depends_on = [
-    cloudflare_r2_bucket_event_notification.main,
-    cloudflare_workers_script_subdomain.consumer,
-    cloudflare_api_token.read,
-  ]
-
-  lifecycle {
-    postcondition {
-      condition     = self.status_code >= 200 && self.status_code < 300 && try(jsondecode(self.response_body).verified, false) == true
-      error_message = "Captain did not confirm enrollment. HTTP ${self.status_code}. Body: ${substr(self.response_body, 0, 400)}. Check that the read token works and the Worker read proxy is reachable, then re-apply."
-    }
-  }
-}

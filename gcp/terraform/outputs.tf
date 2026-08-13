@@ -1,5 +1,5 @@
 output "deployment_id" {
-  description = "Stripe-style deployment id (dep_<token>). Use it to look up deployment state and debug on Captain's side."
+  description = "Stripe-style deployment id (dep_<token>), local to this deployment. It is stamped on the enrollment logs so you can correlate a run when debugging."
   value       = local.deployment_id
 }
 
@@ -14,7 +14,7 @@ output "pubsub_subscription" {
 }
 
 output "push_service_account" {
-  description = "The service account Pub/Sub signs OIDC tokens as. Captain allowlists this email; a push whose token subject is not this SA is rejected."
+  description = "The service account Pub/Sub signs OIDC tokens as on every push delivery to Captain. It has no other permissions."
   value       = google_service_account.push.email
 }
 
@@ -35,5 +35,5 @@ output "oidc_audience" {
 
 output "what_to_do_next" {
   description = "One-line next step."
-  value       = "Deployment ${local.deployment_id} is enrolled and verified. Open your Captain dashboard for sync ${var.sync_id}; a targeted reconcile of gs://${var.bucket_name} runs automatically and future object changes push near-real-time."
+  value       = "Deployment ${local.deployment_id} registered its webhook with Captain. Open your Captain dashboard for sync ${var.sync_id}; object changes on gs://${var.bucket_name} push near-real-time and the reconcile backstop covers anything push misses."
 }

@@ -1,15 +1,19 @@
 # Engineering notes: r2/ (captain-r2-sync)
 
 The Worker typechecks and bundles clean (`wrangler deploy --dry-run`); the
-Terraform validates clean (`tofu validate`, `tofu fmt`). Enrollment
-verification is not yet activated on the Captain backend, so a real deploy
-reaches the phone-home step and fails there by design.
+Terraform validates clean (`tofu validate`, `tofu fmt`). Enrollment runs
+against Captain's live webhook API (`POST
+{API_BASE}/v2/syncs/{sync_id}/webhooks`); a real deploy needs a real sync id,
+a Captain API key, and the subscribe_url Captain mints during the run.
 
 ## Design choices
 
 - **One Worker, three roles** (queue consumer, keyless read proxy,
-  phone-home). Keeps the deploy to a single artifact and makes the keyless
-  read path possible.
+  self-test). Keeps the deploy to a single artifact and makes the keyless
+  read path possible. Enrollment is NOT a Worker role: deploy.sh (Path A)
+  and `data.http.subscribe` (Path B) call Captain's webhook API directly,
+  before any Cloudflare resource exists, so a bad sync id or API key fails
+  the run at the start.
 - **Two read strategies on purpose.** The keyless proxy (Path A, Wrangler)
   is the cleanest no-long-lived-keys story but requires a new reconcile
   adapter on the Captain side (below). The scoped token (Path B,
@@ -73,31 +77,35 @@ remote bucket. A local write never fires a real event notification, which
 looks identical to "notifications are broken." The selftest writes through
 the R2 binding and always hits the real bucket.
 
-## Captain backend contract
+## Captain API contract (the real one)
 
-1. **Ingest receiver** (`CAPTAIN_INGEST_URL`, default
-   `https://api.runcaptain.com/v1/deploy/r2/ingest`). Accepts
-   `{source:"r2", syncId, bucket, accountId, templateVersion,
-   events:[{op, key, size, eTag, action, eventTime}]}` with
-   `Authorization: Bearer <secret>` and `x-captain-sync-id`. It must be
-   idempotent per `(syncId, key, eventTime)` because the Worker retries
-   whole batches on any non-2xx.
-2. **Enroll receiver** (`CAPTAIN_ENROLL_URL`, default
-   `https://api.runcaptain.com/v1/deploy/r2/enroll`). Path A sends the
-   shared `secret`; Path B also sends `readAccessKeyId` + `readSecretKey`.
-   It must actually verify before returning `{"verified": true}`: for
-   Path A, call back the Worker read proxy
-   (`GET {workerUrl}/__captain/objects` with the bearer secret) and
-   confirm it can list; for Path B, use the scoped key against the R2 S3
-   API and confirm the same.
-3. **A reconcile adapter for the keyless proxy.** Path B's key plugs into
-   Captain's existing R2 sync as-is; Path A's proxy is a new read mode
-   (list/fetch over HTTPS from `{workerUrl}/__captain/*` with the bearer
-   secret instead of the S3 API).
-4. **Teardown handling.** `teardown.sh` (Path A) and `tofu destroy`
-   (Path B) remove the client-side resources, but neither currently tells
-   Captain the sync went away; the backend should reconcile orphaned
-   enrollments until a delete handshake exists.
+1. **Webhook subscribe** (enrollment): `POST
+   {API_BASE}/v2/syncs/{sync_id}/webhooks` with
+   `Authorization: Bearer {CAPTAIN_API_KEY}`. `API_BASE` defaults to
+   `https://api.captain.dev` and stays overridable
+   (`CAPTAIN_API_BASE` / `captain_api_base`) for staging. Body is `{}` for
+   R2; the `{"sns_topic_arn": ...}` body is for AWS S3-family syncs only
+   (the API 422s an S3 subscribe without it). A 2xx JSON response carries
+   `subscribe_url` (the per-sync ingest URL Captain minted), `secret_set`
+   (bool), and `instructions` (array of strings). A 2xx with a
+   `subscribe_url` IS successful enrollment; there is nothing further to
+   verify.
+2. **Ingest target** (`CAPTAIN_INGEST_URL`): always the minted
+   `subscribe_url` from the call above, never a hardcoded default. The
+   Worker POSTs `{source:"r2", syncId, bucket, accountId, templateVersion,
+   events:[{op, key, size, eTag, action, eventTime}]}` there with
+   `Authorization: Bearer <CAPTAIN_SECRET>` and `x-captain-sync-id`, and
+   retries whole batches on any non-2xx, so delivery handling should stay
+   idempotent per `(syncId, key, eventTime)`.
+3. **Read access for reconcile.** Path B's scoped key feeds Captain's
+   existing R2 sync (`access_key_id` / `secret_access_key`, entered by the
+   customer; the subscribe call does not transport credentials). Path A's
+   keyless proxy (`{workerUrl}/__captain/*` with the shared secret) is the
+   no-standing-key alternative.
+4. **Teardown.** There is no documented unsubscribe endpoint, and neither
+   `teardown.sh` nor `tofu destroy` invents one: they remove the
+   cloud-side resources only. Captain detects the dead event source, and
+   scheduled reconcile continues as the backstop.
 
 ## Testing changes
 

@@ -1,8 +1,8 @@
 {
   "name": "captain-r2-sync-worker",
-  "version": "2026.8.12",
+  "version": "2026.8.13",
   "private": true,
-  "description": "Captain R2 sync Worker: queue consumer + keyless read proxy + self-verifying phone-home.",
+  "description": "Captain R2 sync Worker: queue consumer + keyless read proxy + event-path self-test.",
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",

@@ -5,12 +5,13 @@
 // near-real-time, entirely inside the CUSTOMER'S Azure subscription:
 //
 //   1. EVENT WIRING: an Event Grid system topic on the storage account plus an
-//      event subscription whose destination is Captain's HTTPS ingest webhook.
-//      Blob -> Event Grid -> direct HTTPS webhook. Event Grid runs its 30-second
-//      validation handshake against Captain's endpoint at subscription-create
-//      time, so the subscription simply will NOT create unless Captain proves it
-//      owns that endpoint. That is the first half of self-verification, and it
-//      is native (no code).
+//      event subscription whose destination is Captain's HTTPS ingest webhook
+//      (the subscribe_url Captain minted for the sync). Blob -> Event Grid ->
+//      direct HTTPS webhook. Event Grid runs its 30-second validation handshake
+//      against Captain's endpoint at subscription-create time, so the
+//      subscription simply will NOT create unless Captain proves it owns that
+//      endpoint. That is the first half of self-verification, and it is native
+//      (no code).
 //
 //   2. CROSS-TENANT READ GRANT (no long-lived keys): a Storage Blob Data Reader
 //      role assignment for Captain's service principal (the one that lives in
@@ -19,17 +20,20 @@
 //      account.
 //
 //   3. SELF-VERIFYING PHONE-HOME: a deployment script (the ARM equivalent of a
-//      CloudFormation custom resource) that POSTs the enrollment facts to
-//      Captain and FAILS the deployment unless Captain returns verified:true.
-//      Captain verifies BOTH halves before it answers: the event subscription
-//      is live (handshake passed) AND it can actually read the blobs (it mints a
-//      token for its SP and does a probe list/read against the account). Only
-//      then does the deployment go green.
+//      CloudFormation custom resource) that enrolls the webhook through
+//      Captain's public API, POST {captainApiBase}/v2/syncs/<syncId>/webhooks
+//      with "Authorization: Bearer <captainApiKey>" and an empty JSON body
+//      (Azure Blob is not an S3-family sync, so no sns_topic_arn), and FAILS
+//      the deployment unless Captain answers 2xx with the sync's
+//      subscribe_url. A 2xx with a subscribe_url IS successful enrollment.
 //
-// So a successful deployment ("CREATE_COMPLETE" equivalent) means Captain has
-// confirmed, end to end, that it can both receive change events and read your
-// objects. A misconfigured deploy fails visibly with a human-readable reason in
-// the deployment-script logs, it does not silently green-light a dead sync.
+// So a successful deployment ("CREATE_COMPLETE" equivalent) means Event Grid
+// proved it can deliver to Captain's live ingest URL (the native handshake)
+// AND Captain's API confirmed the webhook is enrolled on your sync under your
+// API key. A misconfigured deploy fails visibly with a human-readable reason
+// in the deployment-script logs, it does not silently green-light a dead sync.
+// Read access rides the role assignment; if that part is misconfigured,
+// Captain's reconcile surfaces it in the dashboard rather than at deploy time.
 //
 // DESIGN NOTES
 // - Reconcile / polling on Captain's side is the always-on backstop; the Event
@@ -46,15 +50,15 @@
 
 targetScope = 'resourceGroup'
 
-metadata captainTemplateVersion = '2026-08-12'
+metadata captainTemplateVersion = '2026-08-13'
 
 // ---------------------------------------------------------------------------
 // Parameters. Everything tagged "Captain fills this in" is pre-filled by
 // Captain per-sync when it generates your Deploy to Azure link.
 // ---------------------------------------------------------------------------
 
-@description('Template version (date-based YYYY-MM-DD). Sent to Captain on enroll so it knows which contract this deployment speaks. Do not change by hand.')
-param templateVersion string = '2026-08-12'
+@description('Template version (date-based YYYY-MM-DD). Reported in the phone-home user-agent so Captain knows which contract this deployment speaks. Do not change by hand.')
+param templateVersion string = '2026-08-13'
 
 @description('Azure region. MUST equal the region of the storage account you are syncing (an Event Grid storage system topic has to live in the same region as its account). Defaults to this resource group\'s region. Captain fills this in.')
 param location string = resourceGroup().location
@@ -68,24 +72,21 @@ param storageAccountName string
 @maxLength(63)
 param containerName string = ''
 
-@description('Captain Event Grid ingest webhook (HTTPS). Event Grid delivers BlobCreated / BlobDeleted events here and runs its 30-second validation handshake against it at create time. Captain pre-fills this with a per-sync routing token. Must be https. Captain fills this in.')
+@description('Captain Event Grid ingest webhook (HTTPS). This is the subscribe_url Captain mints for your sync when the webhook is enrolled (POST {captainApiBase}/v2/syncs/<syncId>/webhooks). Event Grid delivers BlobCreated / BlobDeleted events here and runs its 30-second validation handshake against it at create time. Must be https. Captain fills this in.')
 param captainEventWebhookUrl string
 
-@description('Captain enrollment endpoint (HTTPS) the phone-home deployment script POSTs the enrollment facts to. Captain verifies event delivery + read access and returns verified:true. Must be https. Captain fills this in.')
-param captainEnrollUrl string = 'https://api.runcaptain.com/v1/deploy/azure/blob/enroll'
+@description('Captain API base URL (HTTPS). The phone-home POSTs to {captainApiBase}/v2/syncs/<syncId>/webhooks. Leave the default unless Captain support points you at a staging environment. Must be https.')
+param captainApiBase string = 'https://api.captain.dev'
+
+@description('Your Captain API key. Sent as "Authorization: Bearer ..." on the webhook-enrollment call, nothing else. Write-only (secure); never surfaced in outputs or logs. Captain fills this in.')
+@secure()
+param captainApiKey string
 
 @description('Object id (GUID) of Captain\'s service principal AS IT EXISTS IN YOUR TENANT after you grant admin consent to the Captain enterprise application. The read role is assigned to this principal. Captain fills this in once consent is complete. This is a keyless, cross-tenant grant: Captain reads with a token for its own identity, never a key or SAS from your account.')
 param captainPrincipalId string
 
-@description('Captain\'s home Azure AD tenant id (GUID). Sent to Captain on enroll for its records; not used to grant access. Captain fills this in.')
-param captainTenantId string = ''
-
 @description('Captain sync id this deployment enrolls, form sync_<token>. Captain fills this in.')
 param syncId string
-
-@description('One-time enrollment secret minted by Captain for this sync. POSTed to the enroll endpoint so Captain can bind this deployment to your sync. Write-only (secure); never surfaced in outputs or logs. Captain fills this in.')
-@secure()
-param secret string
 
 // ---------------------------------------------------------------------------
 // Fixed values and derived names.
@@ -140,9 +141,10 @@ resource systemTopic 'Microsoft.EventGrid/systemTopics@2022-06-15' = {
 // The webhook event subscription. When ARM creates this, Event Grid POSTs a
 // Microsoft.EventGrid.SubscriptionValidationEvent to captainEventWebhookUrl and
 // waits up to 30 seconds for Captain to echo back the validationCode. If Captain
-// does not (wrong URL, endpoint down, endpoint not built), THIS RESOURCE FAILS
-// and the whole deployment fails with a clear Event Grid error. That is the
-// event-delivery half of verification, enforced natively.
+// does not (wrong URL, endpoint down, URL is not the subscribe_url Captain
+// minted), THIS RESOURCE FAILS and the whole deployment fails with a clear
+// Event Grid error. That is the event-delivery half of verification, enforced
+// natively.
 resource eventSubscription 'Microsoft.EventGrid/systemTopics/eventSubscriptions@2022-06-15' = {
   parent: systemTopic
   name: eventSubscriptionName
@@ -150,8 +152,8 @@ resource eventSubscription 'Microsoft.EventGrid/systemTopics/eventSubscriptions@
     destination: {
       endpointType: 'WebHook'
       properties: {
-        // The webhook URL carries a per-sync routing token but is not the
-        // enrollment secret; it is echoed in outputs for the customer's records,
+        // The subscribe_url carries a per-sync routing token but is not a
+        // credential; it is echoed in outputs for the customer's records,
         // so it is intentionally a plain (non-secure) parameter.
         #disable-next-line use-secure-value-for-secure-inputs
         endpointUrl: captainEventWebhookUrl
@@ -202,14 +204,14 @@ resource readGrant 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 // ===========================================================================
 
 // The ARM analog of a CloudFormation custom resource. Runs a container during
-// deployment, POSTs the enrollment facts to Captain, and controls whether the
-// deployment succeeds. It depends on the event subscription and the role grant,
-// so by the time it runs, both are in place and Captain's read probe has a real
-// role assignment to exercise.
+// deployment, enrolls the webhook through Captain's public API, and controls
+// whether the deployment succeeds. It depends on the event subscription and
+// the role grant, so by the time it runs the event wiring already passed the
+// native handshake and the read grant exists.
 //
-// It needs no Azure credentials of its own (it only makes an outbound HTTPS call
-// to Captain), so no managed identity is attached. The secret is passed as a
-// secureValue and is never echoed.
+// It needs no Azure credentials of its own (it only makes an outbound HTTPS
+// call to Captain), so no managed identity is attached. The Captain API key is
+// passed as a secureValue and is never echoed.
 resource enroll 'Microsoft.Resources/deploymentScripts@2020-10-01' = {
   name: enrollScriptName
   location: location
@@ -223,15 +225,12 @@ resource enroll 'Microsoft.Resources/deploymentScripts@2020-10-01' = {
     timeout: 'PT30M'
     cleanupPreference: 'OnSuccess'
     environmentVariables: [
-      { name: 'CAPTAIN_ENROLL_URL', value: captainEnrollUrl }
+      { name: 'CAPTAIN_API_BASE', value: captainApiBase }
+      { name: 'CAPTAIN_API_KEY', secureValue: captainApiKey }
       { name: 'TEMPLATE_VERSION', value: templateVersion }
       { name: 'SYNC_ID', value: syncId }
-      { name: 'SECRET', secureValue: secret }
       { name: 'SUBSCRIPTION_ID', value: subscription().subscriptionId }
-      { name: 'TENANT_ID', value: tenant().tenantId }
-      { name: 'CAPTAIN_TENANT_ID', value: captainTenantId }
       { name: 'RESOURCE_GROUP', value: resourceGroup().name }
-      { name: 'STORAGE_ACCOUNT_ID', value: storage.id }
       { name: 'STORAGE_ACCOUNT_NAME', value: storageAccountName }
       { name: 'CONTAINER_NAME', value: containerName }
       { name: 'SYSTEM_TOPIC', value: systemTopic.name }
@@ -245,7 +244,7 @@ resource enroll 'Microsoft.Resources/deploymentScripts@2020-10-01' = {
 set -euo pipefail
 
 echo "=================================================================="
-echo " Captain Azure Blob enroll (self-verifying phone-home)"
+echo " Captain Azure Blob webhook enrollment (self-verifying phone-home)"
 echo "=================================================================="
 echo "template_version : ${TEMPLATE_VERSION}"
 echo "sync_id          : ${SYNC_ID}"
@@ -258,86 +257,63 @@ echo "event_sub        : ${EVENT_SUBSCRIPTION}"
 echo "event_webhook    : ${EVENT_WEBHOOK_URL}"
 echo "captain_principal: ${PRINCIPAL_ID}"
 echo "role_assignment  : ${ROLE_ASSIGNMENT_ID}"
-echo "enroll_url       : ${CAPTAIN_ENROLL_URL}"
+echo "captain_api_base : ${CAPTAIN_API_BASE}"
+echo "api_key          : <redacted>"
 echo "------------------------------------------------------------------"
 
-# -- Preflight: never send the enrollment secret over plaintext -------------
-case "${CAPTAIN_ENROLL_URL}" in
-  https://*) echo "preflight: enroll URL is https, ok" ;;
-  *) echo "PREFLIGHT FAILED: CAPTAIN_ENROLL_URL must be https:// (refusing to POST the enrollment secret in the clear). Got: ${CAPTAIN_ENROLL_URL}"; exit 1 ;;
+# -- Preflight: never send the API key over plaintext ------------------------
+case "${CAPTAIN_API_BASE}" in
+  https://*) echo "preflight: Captain API base is https, ok" ;;
+  *) echo "PREFLIGHT FAILED: captainApiBase must be https:// (refusing to send the Captain API key in the clear). Got: ${CAPTAIN_API_BASE}"; exit 1 ;;
 esac
 case "${EVENT_WEBHOOK_URL}" in
   https://*) echo "preflight: event webhook is https, ok" ;;
   *) echo "PREFLIGHT WARNING: EVENT_WEBHOOK_URL is not https (${EVENT_WEBHOOK_URL}). Event Grid requires https for the validation handshake; the event subscription step should already have failed if so." ;;
 esac
 
+# The real Captain contract: POST {base}/v2/syncs/{syncId}/webhooks with
+# Bearer auth. Azure Blob is not an S3-family sync, so the body is the empty
+# JSON object (no sns_topic_arn).
+WEBHOOKS_URL="${CAPTAIN_API_BASE%/}/v2/syncs/${SYNC_ID}/webhooks"
+echo "webhooks_url     : ${WEBHOOKS_URL}"
+
 # -- Stripe-style deployment id, no bare UUID --------------------------------
 # python3 secrets.token_hex(12) writes exactly 24 hex chars and exits 0 on its
 # own; no pipe into head, so there is nothing here for pipefail to trip over.
-# python3 is already a hard dependency of this script (used below to build the
-# JSON payload), so this adds no new tool. (A prior version piped /dev/urandom
-# through tr into head -c 24: head closes the pipe once it has its 24 bytes,
-# the upstream cat/tr get SIGPIPE, and set -euo pipefail aborted the whole
-# script before it ever reached the phone-home POST below. openssl was
-# considered as the replacement but is NOT present in the pinned
+# python3 is already a hard dependency of this script (used below for the
+# HTTPS call and JSON parsing), so this adds no new tool. (A prior version
+# piped /dev/urandom through tr into head -c 24: head closes the pipe once it
+# has its 24 bytes, the upstream cat/tr get SIGPIPE, and set -euo pipefail
+# aborted the whole script before it ever reached the phone-home POST below.
+# openssl was considered as the replacement but is NOT present in the pinned
 # mcr.microsoft.com/azure-cli:2.60.0 image (Alpine base, no openssl binary),
-# so it was rejected in favor of python3. Audited: this is the only
-# urandom/head pipeline in this script.)
+# so it was rejected in favor of python3.)
 TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(12))')
 export DEP_ID="dep_${TOKEN}"
-echo "deployment_id    : ${DEP_ID}"
+echo "deployment_id    : ${DEP_ID} (local correlation id; quote it with your sync id to Captain support)"
 
-# -- Build the payload with python3 (keeps the secret out of the arg list) ---
-PAYLOAD=$(python3 - <<'PY'
-import json, os
-print(json.dumps({
-    "deploymentId":        os.environ["DEP_ID"],
-    "templateVersion":     os.environ.get("TEMPLATE_VERSION", ""),
-    "action":              "create",
-    "cloud":               "azure",
-    "provider":            "blob",
-    "subscriptionId":      os.environ.get("SUBSCRIPTION_ID", ""),
-    "tenantId":            os.environ.get("TENANT_ID", ""),
-    "captainTenantId":     os.environ.get("CAPTAIN_TENANT_ID", ""),
-    "resourceGroup":       os.environ.get("RESOURCE_GROUP", ""),
-    "storageAccountId":    os.environ.get("STORAGE_ACCOUNT_ID", ""),
-    "storageAccountName":  os.environ.get("STORAGE_ACCOUNT_NAME", ""),
-    "containerName":       os.environ.get("CONTAINER_NAME", ""),
-    "systemTopic":         os.environ.get("SYSTEM_TOPIC", ""),
-    "eventSubscription":   os.environ.get("EVENT_SUBSCRIPTION", ""),
-    "eventWebhookUrl":     os.environ.get("EVENT_WEBHOOK_URL", ""),
-    "captainPrincipalId":  os.environ.get("PRINCIPAL_ID", ""),
-    "roleAssignmentId":    os.environ.get("ROLE_ASSIGNMENT_ID", ""),
-    "location":            os.environ.get("LOCATION", ""),
-    "syncId":              os.environ.get("SYNC_ID", ""),
-    "secret":              os.environ.get("SECRET", ""),
-}))
-PY
-)
-
-echo "phone-home: POST ${CAPTAIN_ENROLL_URL} (payload omits secret from this log)"
+echo "phone-home: POST ${WEBHOOKS_URL} (empty JSON body; Authorization header redacted from this log)"
 
 # POST with python3's stdlib rather than curl. curl is NOT present in the
 # pinned mcr.microsoft.com/azure-cli:2.60.0 image (it is Alpine-based and only
 # ships wget), so a curl call here would fail "command not found" on every
 # real run, get swallowed by a `|| echo "000"` fallback, and permanently
-# masquerade as "Captain did not verify" even when Captain is healthy. That
-# is the same class of bug as the token generator: the phone-home, the entire
-# point of this artifact, silently never reaches Captain. python3 is already
-# a hard dependency of this script (used above and below to build/parse
-# JSON), so this adds no new tool.
-HTTP_CODE=$(PAYLOAD="${PAYLOAD}" python3 - <<'PY'
+# masquerade as "Captain did not answer" even when Captain is healthy. python3
+# is already a hard dependency of this script, so this adds no new tool. The
+# API key is read from the environment inside python and never appears on an
+# argument list or in this log.
+HTTP_CODE=$(WEBHOOKS_URL="${WEBHOOKS_URL}" python3 - <<'PY'
 import os
 import urllib.error
 import urllib.request
 
-url = os.environ["CAPTAIN_ENROLL_URL"]
-payload = os.environ["PAYLOAD"].encode("utf-8")
+url = os.environ["WEBHOOKS_URL"]
 headers = {
+    "authorization": "Bearer " + os.environ["CAPTAIN_API_KEY"],
     "content-type": "application/json",
     "user-agent": "captain-azure-enroll/" + os.environ.get("TEMPLATE_VERSION", ""),
 }
-req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
 try:
     with urllib.request.urlopen(req, timeout=45) as resp:
         body, code = resp.read(), resp.getcode()
@@ -356,38 +332,22 @@ echo "captain_http_status : ${HTTP_CODE}"
 echo "captain_response    : $(head -c 800 /tmp/captain_resp.json 2>/dev/null || true)"
 echo "------------------------------------------------------------------"
 
-# -- Parse verified + status from Captain's response -------------------------
-# `verified` is the ONLY success signal. `status` is display-only text and
-# must never gate success on its own: a response like {"verified": true,
-# "status": ""} is a real, plausible in-progress/edge shape from Captain, and
-# `d.get('status', 'verified')` would wrongly return "" for it (the key IS
-# present, just empty, so the dict default never kicks in). That used to make
-# CAPTAIN_STATUS empty even though Captain said verified:true, which failed
-# the deployment and printed a misleading "verified : false" right next to
-# the raw response proving otherwise. Fixed by parsing verified and status as
-# two independent fields: status falls back to 'verified' whenever it is
-# either absent OR falsy/empty, but only verified decides success.
+# -- Parse Captain's response -------------------------------------------------
+# Contract: a 2xx JSON object with subscribe_url (string), secret_set (bool),
+# and instructions (array of strings). A 2xx with a subscribe_url IS
+# successful enrollment; subscribe_url is the ONLY success signal here.
+# secret_set and instructions are display-only and never gate success.
 #
-# `status` can ALSO come back as any other JSON type: a number, null, a bool,
-# a list, or a nested object. Nothing in Captain's contract promises it is
-# always a string. The naive `('1'|'0') + '|' + status` concat throws
-# TypeError for any non-string, truthy status (a number, `true`, a non-empty
-# list/object) because Python never implicitly stringifies on `+`. That
-# TypeError used to be swallowed whole by a blanket `except Exception:
-# print('0|')`, so a live Captain returning e.g. {"verified": true, "status":
-# 200} silently came out as verified:false with zero indication why: same
-# bytes on the wire as a genuine failure. Live-reproduced (see NOTES.md) and
-# fixed by coercing `status` to a string for every JSON type BEFORE the
-# concat, and by explicitly checking the top-level shape is an object at all
-# rather than relying on the exception handler to catch it.
-CAPTAIN_PARSED="$(python3 - <<'PY'
+# Parsing is deliberately defensive: nothing stops a proxy/WAF in front of
+# Captain from sending non-JSON, a non-object top level, or unexpected field
+# types, and an earlier build of this script proved that letting a blanket
+# `except` swallow those cases makes a healthy Captain indistinguishable from
+# a dead one. Every field is coerced to readable text before use, and each
+# parse failure degrades to a labeled note instead of a swallowed exception.
+python3 - <<'PY'
 import json
 
-def coerce_status(value):
-    # Defensive coercion: status is documented as text, but nothing stops
-    # Captain (or a proxy/WAF in front of it) from sending a number, null, a
-    # bool, a list, or a nested object. Every JSON type becomes a readable
-    # string here instead of crashing the '+' concat below.
+def as_text(value):
     if value is None:
         return ''
     if isinstance(value, str):
@@ -397,30 +357,60 @@ def coerce_status(value):
     except Exception:
         return str(value)
 
+ok, sub, secret_set, note, lines = '0', '', 'unknown', '', []
 try:
     d = json.load(open('/tmp/captain_resp.json'))
 except Exception:
-    print('0|<unparseable response body>')
+    note = '<unparseable response body>'
 else:
     if not isinstance(d, dict):
-        print('0|<unexpected response shape: top-level JSON is ' + type(d).__name__ + ', not an object>')
+        note = '<unexpected response shape: top-level JSON is ' + type(d).__name__ + ', not an object>'
     else:
-        verified = d.get('verified') is True
-        raw_status = coerce_status(d.get('status'))
-        status = (raw_status or 'verified') if verified else (raw_status or '')
-        print(('1' if verified else '0') + '|' + status)
-PY
-)"
-export CAPTAIN_VERIFIED="${CAPTAIN_PARSED%%|*}"
-export CAPTAIN_STATUS="${CAPTAIN_PARSED#*|}"
+        raw = d.get('subscribe_url')
+        if isinstance(raw, str) and raw:
+            ok, sub = '1', raw
+        else:
+            note = '<response has no usable subscribe_url>'
+        if d.get('secret_set') is True:
+            secret_set = 'true'
+        elif d.get('secret_set') is False:
+            secret_set = 'false'
+        raw_lines = d.get('instructions')
+        if isinstance(raw_lines, list):
+            lines = [as_text(item) for item in raw_lines]
 
-if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ] && [ "${CAPTAIN_VERIFIED}" = "1" ]; then
-  echo "SUCCESS: Captain verified enrollment (event delivery handshake + read-access probe both passed)."
+open('/tmp/captain_ok', 'w').write(ok)
+open('/tmp/captain_sub', 'w').write(sub)
+open('/tmp/captain_secret_set', 'w').write(secret_set)
+open('/tmp/captain_note', 'w').write(note)
+open('/tmp/captain_instructions', 'w').write('\n'.join(lines))
+PY
+CAPTAIN_OK="$(cat /tmp/captain_ok)"
+SUBSCRIBE_URL="$(cat /tmp/captain_sub)"
+SECRET_SET="$(cat /tmp/captain_secret_set)"
+CAPTAIN_NOTE="$(cat /tmp/captain_note)"
+export SUBSCRIBE_URL SECRET_SET
+
+if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ] && [ "${CAPTAIN_OK}" = "1" ]; then
+  echo "SUCCESS: Captain enrolled the webhook for ${SYNC_ID} (2xx with subscribe_url)."
+  echo "subscribe_url : ${SUBSCRIBE_URL}"
+  echo "secret_set    : ${SECRET_SET}"
+  if [ "${SUBSCRIBE_URL}" != "${EVENT_WEBHOOK_URL}" ]; then
+    echo "NOTE: the subscribe_url Captain returned differs from captainEventWebhookUrl."
+    echo "      The event subscription delivers to captainEventWebhookUrl. If events do"
+    echo "      not flow, redeploy with captainEventWebhookUrl set to the subscribe_url"
+    echo "      above. Reconcile remains the backstop either way."
+  fi
+  if [ -s /tmp/captain_instructions ]; then
+    echo "captain instructions:"
+    sed 's/^/  - /' /tmp/captain_instructions
+  fi
   python3 - <<'PY'
 import json, os
 json.dump({
     "deploymentId": os.environ["DEP_ID"],
-    "captainStatus": os.environ.get("CAPTAIN_STATUS", "verified"),
+    "subscribeUrl": os.environ.get("SUBSCRIBE_URL", ""),
+    "secretSet": os.environ.get("SECRET_SET", "unknown"),
     "syncId": os.environ.get("SYNC_ID", ""),
 }, open(os.environ["AZ_SCRIPTS_OUTPUT_PATH"], "w"))
 PY
@@ -428,21 +418,21 @@ PY
   echo "=================================================================="
 else
   echo "=================================================================="
-  echo " ENROLLMENT NOT CONFIRMED BY CAPTAIN. Deployment is failing on"
-  echo " purpose so you see this now, not three days later on a dead sync."
+  echo " WEBHOOK ENROLLMENT NOT CONFIRMED BY CAPTAIN. Deployment is failing"
+  echo " on purpose so you see this now, not three days later on a dead sync."
   echo "------------------------------------------------------------------"
   echo " http_status : ${HTTP_CODE}"
-  echo " verified    : $( [ "${CAPTAIN_VERIFIED}" = "1" ] && echo true || echo false )"
-  echo " status      : ${CAPTAIN_STATUS:-<none>}"
+  echo " parse_note  : ${CAPTAIN_NOTE:-<none>}"
   echo " response    : $(head -c 800 /tmp/captain_resp.json 2>/dev/null || true)"
   echo "------------------------------------------------------------------"
   echo " Common causes:"
-  echo "  - captainPrincipalId is wrong or admin consent for the Captain app"
-  echo "    was never granted -> Captain's read probe cannot get a token."
-  echo "  - role assignment has not propagated yet (Azure AD can take a few"
-  echo "    minutes) -> Captain retries the probe; re-run if it timed out."
-  echo "  - enroll URL or secret does not match this sync -> HTTP 401/403/404."
-  echo "  - Event Grid RP not registered / webhook handshake failed earlier."
+  echo "  - 401/403: captainApiKey is wrong, revoked, or for a different"
+  echo "    Captain workspace than the sync."
+  echo "  - 404: syncId does not exist or is not visible to this API key."
+  echo "  - 422 mentioning sns_topic_arn: the syncId points at an S3-family"
+  echo "    sync; this template is for Azure Blob syncs only."
+  echo "  - status 0 / empty response: outbound HTTPS to ${CAPTAIN_API_BASE}"
+  echo "    blocked, or the base URL is wrong (staging override typo)."
   echo " See azure/README.md 'Debugging a failed deploy' for the full list."
   echo "=================================================================="
   exit 1
@@ -455,11 +445,14 @@ fi
 // Outputs: tell the user exactly what happened and what to do next.
 // ---------------------------------------------------------------------------
 
-@description('Stripe-style deployment id (dep_<token>) generated during the phone-home. Use it to look up deployment state and debug in Captain.')
+@description('Stripe-style local correlation id (dep_<token>) generated during the phone-home. It stays client-side; quote it together with your sync id when talking to Captain support.')
 output deploymentId string = enroll.properties.outputs.deploymentId
 
-@description('Captain-reported enrollment status for this deployment.')
-output captainStatus string = enroll.properties.outputs.captainStatus
+@description('The subscribe_url Captain confirmed for this sync: the per-sync ingest URL the Event Grid subscription delivers to.')
+output subscribeUrl string = enroll.properties.outputs.subscribeUrl
+
+@description('Whether Captain reports a webhook signing secret is set for this sync (true / false / unknown).')
+output webhookSecretSet string = enroll.properties.outputs.secretSet
 
 @description('Resource id of the cross-tenant read role assignment Captain uses.')
 output readRoleAssignmentId string = readGrant.id
@@ -471,4 +464,4 @@ output systemTopicName string = systemTopic.name
 output eventSubscriptionName string = eventSubscription.name
 
 @description('One-line next step.')
-output whatToDoNext string = 'Deployment ${enroll.properties.outputs.deploymentId} is enrolled and verified. Open your Captain dashboard for sync ${syncId}: a targeted reconcile of ${storageAccountName} runs automatically and future blob changes sync near-real-time.'
+output whatToDoNext string = 'Deployment ${enroll.properties.outputs.deploymentId} enrolled the webhook for sync ${syncId}. Future blob changes on ${storageAccountName} sync near-real-time, with Captain reconcile as the backstop. Setup guide: https://docs.captain.dev/guides/sync/set-up'

@@ -2,56 +2,50 @@
 # Captain GCS one-click sync (self-verifying), Terraform edition.
 #
 # MECHANISM: GCS object-change notifications -> Pub/Sub topic -> Pub/Sub PUSH
-# subscription that delivers to Captain's ingest endpoint authenticated with a
-# Google-signed OIDC token (no long-lived keys). A read-only cross-account grant
-# lets Captain LIST/GET objects as its OWN service account for the reconcile
-# backstop. A phone-home makes the apply self-verifying.
+# subscription that delivers to the sync's minted Captain ingest URL
+# (captain_ingest_url, the subscribe_url from POST /v2/syncs/<sync_id>/webhooks)
+# authenticated with a Google-signed OIDC token (no long-lived keys). A
+# read-only cross-account grant lets Captain LIST/GET objects as its OWN
+# service account for the reconcile backstop. A final webhook-registration
+# call to the Captain API closes the loop.
 #
 # -----------------------------------------------------------------------------
 # DEBUGGABLE-DEPLOY DESIGN (read this before editing)
 #
 # The failure mode of "terraform apply and hope": every resource turns green,
-# but if the OIDC audience is wrong, the reader binding did not propagate, or
-# Captain cannot actually receive the push, the sync silently never works and
+# but if the sync id is wrong, the API key is dead, or the push endpoint is
+# not the URL Captain actually minted, the sync silently never works and
 # there is no feedback loop.
 #
-# This template closes the loop with a PHONE-HOME (terraform_data.enroll):
+# This template closes the loop with a WEBHOOK REGISTRATION
+# (terraform_data.enroll):
 #
 #   1. Terraform creates the topic, lets GCS publish to it, attaches the bucket
 #      notification, creates the push subscription with an OIDC token, and grants
 #      Captain's reader service account objectViewer on the bucket.
-#   2. terraform_data.enroll runs LAST and POSTs every enrollment fact to
-#      captain_enroll_url (deploymentId, syncId, secret, topic, subscription,
-#      pushServiceAccount, readerServiceAccount, bucket, project, oidcAudience,
-#      ingestUrl, externalId). Captain then:
-#        - probes the read grant (assumes its own identity, LIST/GET on the
-#          bucket) to prove objectViewer really propagated, and
-#        - confirms it can receive the push delivery / allowlists the push SA,
-#      returning 2xx with {"verified": true} only if BOTH pass.
+#   2. terraform_data.enroll runs LAST and calls the real Captain API:
+#      POST {captain_api_base}/v2/syncs/{sync_id}/webhooks with
+#      "Authorization: Bearer {captain_api_key}" and an empty JSON body (GCS
+#      syncs need no body fields). A 2xx response with a subscribe_url is a
+#      successful enrollment; enroll.sh also warns if that subscribe_url
+#      differs from the captain_ingest_url the subscription was pointed at.
 #   3. enroll.sh exits non-zero on anything else, which FAILS the apply with a
 #      human-readable error in the Terraform output. The customer sees the
 #      failure now, not three days later when documents are stale.
 #
-# So a clean apply means Captain confirmed, end to end, that it can both receive
-# events and read your objects. On destroy the phone-home sends a best-effort
-# teardown notice that never blocks the destroy.
+# So a clean apply means the resources exist AND Captain has the webhook on
+# file for this sync. On destroy no API call is made: no unsubscribe endpoint
+# is documented, and none is needed. Captain detects the dead event source
+# and the reconcile backstop keeps the sync consistent.
 # =============================================================================
 
 locals {
   # Stripe-style deployment id (dep_<token>); no bare UUIDs in customer output.
   deployment_id    = "dep_${random_string.dep_token.result}"
-  template_version = "2026-08-12"
+  template_version = "2026-08-13"
 
   # Effective OIDC audience: default to the ingest URL when not overridden.
   oidc_audience = var.oidc_audience != "" ? var.oidc_audience : var.captain_ingest_url
-
-  # Carry the external id on the push endpoint so Captain can bind an incoming
-  # delivery to the right sync even before it has looked up the OIDC subject.
-  # Both values are urlencode()'d: sync_id and external_id are also charset-
-  # validated in variables.tf, but the query string is not the place to trust
-  # that invariant a second time, so it is encoded regardless of what the
-  # validation currently allows.
-  push_endpoint = "${var.captain_ingest_url}?sync_id=${urlencode(var.sync_id)}&external_id=${urlencode(var.external_id)}"
 
   common_labels = merge(var.labels, {
     "captain-sync-id"    = var.sync_id
@@ -189,7 +183,9 @@ resource "google_pubsub_subscription" "captain_push" {
   }
 
   push_config {
-    push_endpoint = local.push_endpoint
+    # The minted subscribe_url exactly as Captain returned it. Nothing is
+    # appended: the URL already identifies the sync.
+    push_endpoint = var.captain_ingest_url
 
     oidc_token {
       service_account_email = google_service_account.push.email
@@ -213,7 +209,7 @@ resource "google_pubsub_subscription" "captain_push" {
 # Grant Captain's OWN service account read on exactly this one bucket. Captain
 # authenticates as this identity from its own project, so nothing but an IAM
 # binding lives in the customer account. This is the reconcile backstop's read
-# path and what the phone-home probe verifies.
+# path.
 resource "google_storage_bucket_iam_member" "captain_reader" {
   bucket = var.bucket_name
   role   = "roles/storage.objectViewer"
@@ -221,79 +217,42 @@ resource "google_storage_bucket_iam_member" "captain_reader" {
 }
 
 # =============================================================================
-# 4. SELF-VERIFYING PHONE-HOME (enroll + handshake)
+# 4. WEBHOOK REGISTRATION (the real Captain API)
 # =============================================================================
 
-# terraform_data carries the enrollment facts as its input so BOTH the create and
-# the destroy provisioner can read them from self.input (destroy provisioners may
-# not reference variables or other resources). It depends on every resource above,
-# so the phone-home runs LAST and Captain probes real, finished plumbing.
+# terraform_data carries the registration facts as its input so a change to any
+# of them (sync id, API base, ingest URL, API key) re-runs the registration on
+# the next apply. It depends on every resource above, so the call runs LAST,
+# after the plumbing it registers actually exists.
+#
+# There is deliberately NO destroy-time provisioner: Captain documents no
+# unsubscribe endpoint. `terraform destroy` just removes the cloud-side
+# resources; Captain detects the dead event source and the reconcile backstop
+# keeps the sync consistent.
 resource "terraform_data" "enroll" {
   input = {
-    enroll_url       = var.captain_enroll_url
+    api_base         = var.captain_api_base
+    sync_id          = var.sync_id
+    ingest_url       = var.captain_ingest_url
     deployment_id    = local.deployment_id
     template_version = local.template_version
-    sync_id          = var.sync_id
-    external_id      = var.external_id
-    project_id       = var.project_id
-    bucket           = var.bucket_name
-    topic            = google_pubsub_topic.captain_sync.id
-    subscription     = google_pubsub_subscription.captain_push.id
-    push_sa          = google_service_account.push.email
-    reader_sa        = var.captain_reader_service_account
-    ingest_url       = var.captain_ingest_url
-    oidc_audience    = local.oidc_audience
     # Sensitive; passed to the script via env only, never rendered in outputs.
-    secret = var.enrollment_secret
+    api_key = var.captain_api_key
   }
 
-  # CREATE / UPDATE: enroll and require a verified response, or fail the apply.
+  # CREATE / UPDATE: register the webhook, require 2xx + subscribe_url, or
+  # fail the apply.
   provisioner "local-exec" {
     when        = create
     interpreter = ["/usr/bin/env", "bash", "${path.module}/enroll.sh"]
-    command     = "create"
+    command     = "enroll"
     environment = {
-      CAPTAIN_ENROLL_URL     = self.input.enroll_url
-      ACTION                 = "create"
-      DEPLOYMENT_ID          = self.input.deployment_id
-      TEMPLATE_VERSION       = self.input.template_version
-      SYNC_ID                = self.input.sync_id
-      EXTERNAL_ID            = self.input.external_id
-      PROJECT_ID             = self.input.project_id
-      BUCKET_NAME            = self.input.bucket
-      PUBSUB_TOPIC           = self.input.topic
-      PUBSUB_SUBSCRIPTION    = self.input.subscription
-      PUSH_SERVICE_ACCOUNT   = self.input.push_sa
-      READER_SERVICE_ACCOUNT = self.input.reader_sa
-      INGEST_URL             = self.input.ingest_url
-      OIDC_AUDIENCE          = self.input.oidc_audience
-      ENROLLMENT_SECRET      = self.input.secret
-    }
-  }
-
-  # DESTROY: best-effort teardown notice. on_failure = continue so a teardown
-  # hiccup never blocks the destroy (reconcile on Captain's side cleans orphans).
-  provisioner "local-exec" {
-    when        = destroy
-    on_failure  = continue
-    interpreter = ["/usr/bin/env", "bash", "${path.module}/enroll.sh"]
-    command     = "delete"
-    environment = {
-      CAPTAIN_ENROLL_URL     = self.input.enroll_url
-      ACTION                 = "delete"
-      DEPLOYMENT_ID          = self.input.deployment_id
-      TEMPLATE_VERSION       = self.input.template_version
-      SYNC_ID                = self.input.sync_id
-      EXTERNAL_ID            = self.input.external_id
-      PROJECT_ID             = self.input.project_id
-      BUCKET_NAME            = self.input.bucket
-      PUBSUB_TOPIC           = self.input.topic
-      PUBSUB_SUBSCRIPTION    = self.input.subscription
-      PUSH_SERVICE_ACCOUNT   = self.input.push_sa
-      READER_SERVICE_ACCOUNT = self.input.reader_sa
-      INGEST_URL             = self.input.ingest_url
-      OIDC_AUDIENCE          = self.input.oidc_audience
-      ENROLLMENT_SECRET      = self.input.secret
+      CAPTAIN_API_BASE = self.input.api_base
+      SYNC_ID          = self.input.sync_id
+      CAPTAIN_API_KEY  = self.input.api_key
+      INGEST_URL       = self.input.ingest_url
+      DEPLOYMENT_ID    = self.input.deployment_id
+      TEMPLATE_VERSION = self.input.template_version
     }
   }
 
