@@ -5,7 +5,7 @@ near-real-time sync. Captain is a headless indexing and retrieval API. Change
 events have to originate inside YOUR cloud account, so each provider ships a
 template you launch yourself, in your account, with your credentials.
 
-[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=captain-s3-sync&templateURL=https://captain-templates.s3.amazonaws.com/templates/2026-08-13/captain-s3-sync.yaml)
+[![Launch Stack](assets/launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=captain-s3-sync&templateURL=https://captain-templates.s3.amazonaws.com/templates/2026-08-13/captain-s3-sync.yaml)
 
 The button opens CloudFormation in your own AWS account with the template
 loaded; you review the parameters and click Create. Details, required IAM, and

@@ -16,7 +16,7 @@ Stack link. Full walkthrough:
 
 ## Launch Stack
 
-[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://captain-templates.s3.amazonaws.com/templates/2026-08-13/captain-s3-sync.yaml&stackName=captain-s3-sync)
+[![Launch Stack](../../assets/launch-stack.png)](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://captain-templates.s3.amazonaws.com/templates/2026-08-13/captain-s3-sync.yaml&stackName=captain-s3-sync)
 
 The link, expanded:
 
