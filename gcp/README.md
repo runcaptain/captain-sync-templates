@@ -56,10 +56,10 @@ cd gcp/gcloud
   --reader-sa captain-reader@captain-prod.iam.gserviceaccount.com
 ```
 
-The Cloud Shell link is not yet active. Until Captain publishes this repo at
-that location, clone the repo and run `gcloud/setup.sh` directly with the
-values Captain generated for your sync, or contact Captain for the current
-link and reader service account.
+Prefer your own terminal? Clone the repo and run `gcloud/setup.sh` directly
+with the values Captain generated for your sync. Contact Captain if you do
+not yet have your sync id, external id, secret, or the reader service
+account email.
 
 ## Terraform path
 
