@@ -75,6 +75,6 @@ captain-sync-templates/
 ## Contributing
 
 Issues and pull requests are welcome. Each cloud folder is self-contained, so
-changes to one provider never touch another. The `NOTES.md` files alongside
-some templates hold engineering context for contributors and are not part of
-the customer-facing docs.
+changes to one provider never touch another. The `NOTES.md` file in each
+cloud folder (and at the repo root) holds engineering context for
+contributors and is not part of the customer-facing docs.
