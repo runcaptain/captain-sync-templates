@@ -1,0 +1,9 @@
+# Terraform / OpenTofu
+.terraform/
+# .terraform.lock.hcl is intentionally NOT ignored: it pins provider
+# versions and should be committed, matching the aws/ and b2/ templates.
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+!terraform.tfvars.example
+tfplan

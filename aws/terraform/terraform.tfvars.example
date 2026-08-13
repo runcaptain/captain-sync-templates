@@ -1,0 +1,29 @@
+# Captain normally generates this file for you, pre-filled per sync. Copy it to
+# terraform.tfvars and confirm the values before `terraform apply`.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# The secret is a one-time enrollment secret. Do not commit terraform.tfvars.
+
+# Region MUST match your bucket's region.
+aws_region = "us-east-1"
+
+# Your existing bucket.
+bucket_name = "my-existing-bucket"
+
+# Optional: restrict the sync to a key prefix. Empty = whole bucket.
+object_prefix = ""
+
+# Optional: set ONLY if the bucket uses SSE-KMS with a customer-managed key.
+# Empty for SSE-S3 (AES256) or unencrypted buckets.
+kms_key_arn = ""
+
+# ---- Captain fills these in when it generates your tfvars --------------------
+captain_callback_url = "https://api.runcaptain.com/v1/deploy/aws/s3/enroll"
+captain_account_id   = "000000000000"
+sync_id              = "sync_REPLACE_ME"
+external_id          = "REPLACE_WITH_PER_SYNC_EXTERNAL_ID"
+secret               = "REPLACE_WITH_ONE_TIME_ENROLLMENT_SECRET"
+
+# Verbose deploy logging. "true" while standing up, "false" to quiet afterwards.
+debug_logging = "true"

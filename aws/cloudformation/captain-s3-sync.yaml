@@ -2,18 +2,20 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 # Template version (date-based, YYYY-MM-DD). Bump this when the template shape
 # changes and re-host it under a matching dated path, e.g.
-#   .../templates/2026-08-12/captain-s3-sync.yaml
+#   .../templates/2026-08-13/captain-s3-sync.yaml
 # Customer-facing object ids in this template are Stripe-style prefix_token
 # (dep_..., sync_...), never bare UUIDs.
 Metadata:
   Captain:
-    TemplateVersion: "2026-08-12"
+    TemplateVersion: "2026-08-13"
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label: { default: "Captain enrollment (pre-filled by Captain, confirm before launch)" }
         Parameters: [CaptainCallbackUrl, CaptainAccountId, SyncId, ExternalId, Secret]
       - Label: { default: "Your bucket" }
-        Parameters: [BucketName]
+        Parameters: [BucketName, ObjectPrefix, KmsKeyArn]
+      - Label: { default: "Advanced" }
+        Parameters: [DebugLogging]
     ParameterLabels:
       CaptainCallbackUrl: { default: "Captain callback URL" }
       CaptainAccountId: { default: "Captain AWS account id" }
@@ -21,6 +23,9 @@ Metadata:
       ExternalId: { default: "External id (confused-deputy guard)" }
       Secret: { default: "Enrollment secret (write-only)" }
       BucketName: { default: "S3 bucket to sync" }
+      ObjectPrefix: { default: "Key prefix to scope the sync (optional)" }
+      KmsKeyArn: { default: "KMS key ARN if the bucket is SSE-KMS encrypted (optional)" }
+      DebugLogging: { default: "Verbose CloudWatch logging" }
 
 Description: >
   Captain S3 one-click sync (self-verifying). Stands up the cross-account plumbing
@@ -45,13 +50,13 @@ Description: >
 #      BUCKET NOTIFICATION CONSTRAINT block below for why this is a custom
 #      resource and not a native property on a pre-existing bucket).
 #   3. The EnrollWithCaptain custom resource POSTs every fact Captain needs
-#      (stackId, region, bucket, snsTopicArn, roleArn, externalId, syncId,
-#      secret, deploymentId) to CaptainCallbackUrl. Captain then:
+#      (stackId, region, bucket, prefix, snsTopicArn, roleArn, externalId,
+#      syncId, secret, deploymentId) to CaptainCallbackUrl. Captain then:
 #        - subscribes its own endpoint to the SNS topic,
 #        - assumes the read role with the external id (proving the trust +
 #          policy actually work),
 #        - runs a verification handshake, and
-#        - returns 2xx only if all of that succeeded.
+#        - returns 2xx with {"verified": true} only if all of that succeeded.
 #   4. If the callback is non-2xx, times out, or errors, the custom resource
 #      sends FAILED to CloudFormation with a human-readable Reason. That turns
 #      into a red line in Stack Events and rolls the stack back. The customer
@@ -60,6 +65,11 @@ Description: >
 #
 # So the deploy is self-verifying: a SUCCEEDED stack means Captain has
 # confirmed, end to end, that it can both receive events and read objects.
+#
+# Every Lambda in here logs heavily to CloudWatch (single-line, structured,
+# secret-redacted), answers CloudFormation on EVERY path (so the stack never
+# hangs the full hour), and validates its inputs up front with human-readable
+# error messages. See the CAPTAIN-ENROLL / CAPTAIN-SETNOTIF log prefixes.
 # ---------------------------------------------------------------------------
 
 Parameters:
@@ -88,6 +98,8 @@ Parameters:
     Type: String
     MinLength: 8
     MaxLength: 1224
+    AllowedPattern: "^[A-Za-z0-9+=,.@:/_-]{8,1224}$"
+    ConstraintDescription: 8-1224 chars from the STS external-id character set (letters, digits, +=,.@:/_-).
     Description: >
       Per-sync external id. Captain must present it when assuming the read role,
       which blocks the confused-deputy problem (another Captain tenant cannot
@@ -99,10 +111,39 @@ Parameters:
     ConstraintDescription: Must be a valid S3 bucket name (3-63 chars, lowercase).
     Description: The EXISTING S3 bucket to sync. This template does not create it.
 
+  ObjectPrefix:
+    Type: String
+    Default: ""
+    MaxLength: 1024
+    AllowedPattern: "^[^\\n\\r]*$"
+    ConstraintDescription: A single-line S3 key prefix (or empty for the whole bucket).
+    Description: >
+      Optional. Restrict the sync to keys under this prefix, e.g. "docs/". When
+      set, both the S3 event filter AND the read role are scoped to it, so Captain
+      can neither see nor fetch objects outside the prefix. Leave empty to sync the
+      whole bucket.
+
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:[a-z-]+:kms:[a-z0-9-]+:[0-9]{12}:key/.+$"
+    ConstraintDescription: Empty, or a full KMS key ARN (arn:aws:kms:REGION:ACCOUNT:key/KEY-ID).
+    Description: >
+      Optional but REQUIRED if your bucket uses SSE-KMS with a customer-managed key.
+      Without kms:Decrypt on that key, Captain's GetObject calls fail with
+      AccessDenied even though the role has s3:GetObject. Set this to the bucket's
+      KMS key ARN and the read role gets kms:Decrypt scoped to exactly that key.
+      Leave empty for SSE-S3 (AES256) buckets or unencrypted buckets.
+
   SyncId:
     Type: String
+    MaxLength: 44
     AllowedPattern: "^sync_[A-Za-z0-9]+$"
-    ConstraintDescription: Must be a Captain sync id of the form sync_<token>.
+    ConstraintDescription: >-
+      Must be a Captain sync id of the form sync_<token>, 44 chars or fewer.
+      SyncId is baked verbatim into IAM role and Lambda function names, which
+      AWS caps at 64 chars; 44 is the longest value that still fits under the
+      longest of those names (captain-s3-setnotif-<SyncId>).
     Description: The Captain sync id (sync_<token>) this deployment enrolls. Captain fills this in.
 
   Secret:
@@ -112,7 +153,20 @@ Parameters:
     Description: >
       One-time enrollment secret minted by Captain for this sync. Sent to
       CaptainCallbackUrl so Captain can bind this deployment to your sync. Write-only
-      (NoEcho); never surfaced in Outputs or logs.
+      (NoEcho); never surfaced in Outputs or logs (the Lambda redacts it).
+
+  DebugLogging:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Verbose CloudWatch logging for the deploy Lambdas. Leave "true" while you are
+      standing the sync up; every step prints a structured, secret-redacted line so
+      a failed deploy is easy to read. Set "false" to quiet the logs afterwards.
+
+Conditions:
+  HasPrefix: !Not [!Equals [!Ref ObjectPrefix, ""]]
+  HasKmsKey: !Not [!Equals [!Ref KmsKeyArn, ""]]
 
 Resources:
 
@@ -175,12 +229,45 @@ Resources:
   #
   # So we set the notification through a custom resource that does an ADDITIVE
   # read-merge-write: GET the existing config, APPEND our TopicConfiguration
-  # (tagged with our sync id), PUT the merged result. On delete it removes only
-  # OUR topic config and leaves every sibling hook untouched. If you would
-  # rather not grant the notification-management permission, delete this custom
-  # resource and its role and run the documented manual step in the README
-  # instead; everything else in the stack still stands up.
+  # (its Id is captain-<syncId> so two Captain syncs on one bucket do NOT
+  # collide), PUT the merged result. On delete it removes only OUR config and
+  # leaves every sibling hook untouched. If you would rather not grant the
+  # notification-management permission, delete this custom resource and its role
+  # and run the documented manual step in the README instead; everything else in
+  # the stack still stands up.
   # -------------------------------------------------------------------------
+
+  # Plain stack-owned log group: created with the stack, deleted with the
+  # stack in the normal delete path, 30-day retention. Two hard-won rules
+  # (both confirmed live, see ../../NOTES.md):
+  #
+  # 1. KNOWN, ACCEPTED limitation: CloudFormation's native DeleteLogGroup can
+  #    race CloudWatch's asynchronous delivery of this Lambda's own trailing
+  #    log lines during a rollback, so a log group is OCCASIONALLY left
+  #    behind after a failed deploy (recreated by CloudWatch a moment after
+  #    CloudFormation deleted it). That residue is cosmetic (empty or
+  #    near-empty) and removable with a one-line `aws logs delete-log-group`.
+  #    Do NOT "fix" it with DeletionPolicy: Retain plus a cleanup custom
+  #    resource: that was tried and reverted (it guaranteed a retained,
+  #    never-deleted group and broke every retry).
+  #
+  # 2. The log group NAME must NOT be deterministic on SyncId alone. The
+  #    name embeds a per-stack-instance token (first segment of the
+  #    AWS::StackId UUID, unique per create attempt), because an orphan left
+  #    by rule 1 otherwise hard-fails the customer's RETRY of the same
+  #    Launch Stack link (same SyncId) at resource validation with "already
+  #    exists". Confirmed live: with plain /aws/lambda/<function> names, a
+  #    natural create-fail-rollback left both log groups orphaned and the
+  #    identical retry was rejected before creating anything. The Lambda
+  #    below points at this group explicitly via LoggingConfig, so the
+  #    function name itself stays deterministic and readable.
+  SetBucketNotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/captain/s3-sync/${SyncId}/${AttemptToken}/setnotif"
+        - AttemptToken: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+      RetentionInDays: 30
 
   SetBucketNotificationRole:
     Type: AWS::IAM::Role
@@ -213,58 +300,185 @@ Resources:
       Handler: index.handler
       Timeout: 120
       Role: !GetAtt SetBucketNotificationRole.Arn
+      # Log to the stack-owned, per-attempt log group above (NOT the default
+      # /aws/lambda/<function-name>) -- see rule 2 on the log group.
+      LoggingConfig:
+        LogGroup: !Ref SetBucketNotificationLogGroup
+      Environment:
+        Variables:
+          CAPTAIN_DEBUG: !Ref DebugLogging
       Code:
         ZipFile: |
           # Additively point an EXISTING bucket's notifications at our SNS topic
           # WITHOUT clobbering any hooks the customer already has, and always
           # answer CloudFormation so the stack never hangs for an hour.
-          import json, urllib.request, boto3
+          #
+          # CONFIRMED LIMIT (adversarial testing): "additive" only works when it
+          # does not collide with what is already there. A bucket has exactly ONE
+          # notification configuration, and S3 itself rejects
+          # PutBucketNotificationConfiguration with InvalidArgument
+          # "Configurations overlap" whenever our new config's event type
+          # (ObjectCreated/ObjectRemoved) overlaps an EXISTING hook's event type
+          # on an overlapping prefix. A whole-bucket sync (empty prefix) overlaps
+          # ANY existing ObjectCreated/ObjectRemoved hook. So before writing, this
+          # function reads the existing config and checks for that overlap
+          # itself, and fails the resource fast with a specific, actionable
+          # Reason (naming the conflicting hook's id/event/prefix) instead of
+          # letting S3's opaque InvalidArgument surface. This fails SAFE either
+          # way -- the PUT is atomic, so a rejected/skipped write never touches
+          # the existing config -- but the deploy itself does not succeed for a
+          # bucket that already has an overlapping hook. The only way out today
+          # is a non-overlapping ObjectPrefix; see ../../NOTES.md.
+          #
+          # Heavy, structured, single-line logging under the CAPTAIN-SETNOTIF
+          # prefix so a failed merge is readable in CloudWatch at a glance.
+          import json, os, urllib.request, boto3
 
+          DEBUG = os.environ.get("CAPTAIN_DEBUG", "true").lower() == "true"
           s3 = boto3.client("s3")
-          SID = "CaptainSyncTopic"  # marker so we can find + remove only our config
+
+          # Event types our own notification config always registers. Any
+          # existing hook whose Events include one of these (as a prefix match,
+          # so "s3:ObjectCreated:Put" matches "s3:ObjectCreated") shares an
+          # event category with ours.
+          OUR_EVENT_PREFIXES = ("s3:ObjectCreated", "s3:ObjectRemoved")
+
+          def log(tag, **kw):
+              if not DEBUG and tag.endswith("-debug"):
+                  return
+              print("CAPTAIN-SETNOTIF %s %s" % (tag, json.dumps(kw, default=str)))
+
+          def _prefixes_overlap(a, b):
+              # Two S3 key prefixes overlap if one is a prefix of the other (an
+              # empty prefix -- "whole bucket" -- is a prefix of everything, so
+              # it overlaps any other prefix too).
+              return a.startswith(b) or b.startswith(a)
+
+          def find_notification_conflict(cfg, config_id, prefix):
+              # Look for an EXISTING notification config (not ours) whose event
+              # type overlaps ours (ObjectCreated/ObjectRemoved) on a prefix
+              # that overlaps `prefix`. Returns
+              # (existing_id, conflicting_event, existing_prefix) or None.
+              all_configs = (
+                  list(cfg.get("TopicConfigurations") or [])
+                  + list(cfg.get("QueueConfigurations") or [])
+                  + list(cfg.get("LambdaFunctionConfigurations") or [])
+              )
+              for entry in all_configs:
+                  if entry.get("Id") == config_id:
+                      continue  # our own prior config; being replaced, not a conflict
+                  existing_prefix = ""
+                  rules = ((entry.get("Filter") or {}).get("Key") or {}).get(
+                      "FilterRules") or []
+                  for rule in rules:
+                      if (rule.get("Name") or "").lower() == "prefix":
+                          existing_prefix = rule.get("Value") or ""
+                  conflicting_events = [
+                      e for e in (entry.get("Events") or [])
+                      if e.startswith(OUR_EVENT_PREFIXES)]
+                  if conflicting_events and _prefixes_overlap(prefix, existing_prefix):
+                      return (entry.get("Id", "<unknown>"), conflicting_events[0],
+                              existing_prefix)
+              return None
 
           def send(evt, ctx, status, reason, pid=None):
+              # Answer the CloudFormation pre-signed URL. Swallow (but log loudly)
+              # any failure: nothing else we can do, and re-raising helps no one.
               body = json.dumps({
                   "Status": status, "Reason": reason[:1024],
                   "PhysicalResourceId": pid or ctx.log_stream_name,
                   "StackId": evt["StackId"], "RequestId": evt["RequestId"],
                   "LogicalResourceId": evt["LogicalResourceId"], "Data": {},
               }).encode()
-              req = urllib.request.Request(
-                  evt["ResponseURL"], data=body, method="PUT",
-                  headers={"content-type": "", "content-length": str(len(body))})
-              urllib.request.urlopen(req, timeout=30)
+              log("cfn-respond", status=status, reason=reason[:200])
+              try:
+                  req = urllib.request.Request(
+                      evt["ResponseURL"], data=body, method="PUT",
+                      headers={"content-type": "", "content-length": str(len(body))})
+                  urllib.request.urlopen(req, timeout=30)
+                  log("cfn-respond-ok")
+              except Exception as e:
+                  log("cfn-respond-FAILED", error=str(e))
 
           def handler(evt, ctx):
               rtype = evt.get("RequestType")
               props = evt.get("ResourceProperties", {})
               bucket = props.get("BucketName")
               topic = props.get("TopicArn")
+              config_id = props.get("ConfigId") or "captain-sync"
+              prefix = props.get("ObjectPrefix") or ""
+              log("invoke", requestType=rtype, bucket=bucket, topic=topic,
+                  configId=config_id, prefix=prefix,
+                  logStream=getattr(ctx, "log_stream_name", None))
               try:
+                  if not bucket or not topic:
+                      raise ValueError(
+                          "missing BucketName or TopicArn in ResourceProperties")
                   cfg = s3.get_bucket_notification_configuration(Bucket=bucket)
                   cfg.pop("ResponseMetadata", None)
-                  topics = [t for t in cfg.get("TopicConfigurations", [])
-                            if t.get("Id") != SID]  # drop any prior copy of ours
+                  existing = cfg.get("TopicConfigurations", [])
+                  # Log the full shape so a customer can see we preserve siblings.
+                  log("existing-config",
+                      topicConfigs=len(existing),
+                      queueConfigs=len(cfg.get("QueueConfigurations", [])),
+                      lambdaConfigs=len(cfg.get("LambdaFunctionConfigurations", [])),
+                      eventBridge=("EventBridgeConfiguration" in cfg))
+                  topics = [t for t in existing if t.get("Id") != config_id]
+                  removed = len(existing) - len(topics)  # prior copies of ours
                   if rtype in ("Create", "Update"):
-                      topics.append({
-                          "Id": SID,
+                      conflict = find_notification_conflict(cfg, config_id, prefix)
+                      if conflict is not None:
+                          conflict_id, conflict_event, conflict_prefix = conflict
+                          msg = (
+                              "Existing notification config %r on this bucket "
+                              "already handles %s on prefix %r, which overlaps "
+                              "the prefix %r this sync would write. S3 does not "
+                              "allow two notification configs with overlapping "
+                              "event types on overlapping prefixes "
+                              "(PutBucketNotificationConfiguration rejects it "
+                              "with InvalidArgument: Configurations overlap). "
+                              "Set a non-overlapping ObjectPrefix for this "
+                              "sync (see NOTES.md)."
+                              % (conflict_id, conflict_event, conflict_prefix, prefix)
+                          )
+                          log("overlap-conflict", conflictId=conflict_id,
+                              conflictEvent=conflict_event,
+                              conflictPrefix=conflict_prefix, ourPrefix=prefix)
+                          raise ValueError(msg)
+                      entry = {
+                          "Id": config_id,
                           "TopicArn": topic,
                           "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
-                      })
-                  # On Delete we simply do not re-add ours -> it is removed.
+                      }
+                      if prefix:
+                          entry["Filter"] = {"Key": {"FilterRules": [
+                              {"Name": "prefix", "Value": prefix}]}}
+                      topics.append(entry)
+                      log("merged", oursAdded=1,
+                          siblingsPreserved=len(topics) - 1,
+                          priorCopiesReplaced=removed)
+                  else:  # Delete: do not re-add ours -> it is removed.
+                      log("removing-ours", siblingsPreserved=len(topics),
+                          oursRemoved=removed)
                   if topics:
                       cfg["TopicConfigurations"] = topics
                   else:
                       cfg.pop("TopicConfigurations", None)
                   s3.put_bucket_notification_configuration(
                       Bucket=bucket, NotificationConfiguration=cfg)
-                  send(evt, ctx, "SUCCESS", "notification config updated")
+                  log("put-ok")
+                  send(evt, ctx, "SUCCESS",
+                       "notification config updated (id=%s, prefix=%r)"
+                       % (config_id, prefix))
               except Exception as e:
                   # On Delete, never wedge the stack on a teardown error.
+                  log("error", requestType=rtype, error=str(e))
                   if rtype == "Delete":
                       send(evt, ctx, "SUCCESS", "delete tolerated error: %s" % e)
                   else:
-                      send(evt, ctx, "FAILED", "set notification failed: %s" % e)
+                      send(evt, ctx, "FAILED",
+                           "Could not set bucket notification on %s: %s"
+                           % (bucket, e))
 
   SetBucketNotification:
     Type: Custom::SetBucketNotification
@@ -275,6 +489,10 @@ Resources:
       ServiceToken: !GetAtt SetBucketNotificationFunction.Arn
       BucketName: !Ref BucketName
       TopicArn: !Ref CaptainSyncTopic
+      # Per-sync id so two Captain syncs on one bucket do not collide (S3 requires
+      # notification config ids to be unique within a bucket).
+      ConfigId: !Sub "captain-${SyncId}"
+      ObjectPrefix: !Ref ObjectPrefix
 
   # =========================================================================
   # 2. CROSS-ACCOUNT READ ROLE (the assume_role path, no long-lived keys)
@@ -282,7 +500,8 @@ Resources:
 
   # Captain assumes this role to LIST and GET objects during reconcile. Trust is
   # limited to Captain's account AND gated by the external id (confused-deputy
-  # protection). Permissions are limited to read on exactly this one bucket.
+  # protection). Permissions are limited to read on exactly this one bucket, and
+  # further to the prefix / KMS key when those are supplied.
   CaptainReadRole:
     Type: AWS::IAM::Role
     Properties:
@@ -308,10 +527,31 @@ Resources:
                 Effect: Allow
                 Action: s3:ListBucket
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+                # When a prefix is set, listing is confined to it. Captain lists
+                # with the prefix on a prefixed sync, so this stays functional
+                # while keeping key names outside the prefix invisible.
+                Condition: !If
+                  - HasPrefix
+                  - StringLike:
+                      s3:prefix: [!Sub "${ObjectPrefix}*"]
+                  - !Ref "AWS::NoValue"
               - Sid: GetObjectsInThisBucket
                 Effect: Allow
                 Action: s3:GetObject
-                Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}/*"
+                Resource: !If
+                  - HasPrefix
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${ObjectPrefix}*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/*"
+              # Only present for SSE-KMS buckets: decrypt scoped to the one key.
+              - !If
+                - HasKmsKey
+                - Sid: DecryptWithBucketCmk
+                  Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:DescribeKey
+                  Resource: !Ref KmsKeyArn
+                - !Ref "AWS::NoValue"
       Tags:
         - { Key: captain:sync-id, Value: !Ref SyncId }
         - { Key: captain:managed-by, Value: cloudformation }
@@ -319,6 +559,18 @@ Resources:
   # =========================================================================
   # 3. SELF-VERIFYING CUSTOM RESOURCE (phone home + handshake)
   # =========================================================================
+
+  # Plain stack-owned log group; same two rules as
+  # SetBucketNotificationLogGroup above (see that comment and ../../NOTES.md):
+  # accepted rollback-race caveat, and a per-attempt name so an orphan can
+  # never collide with a same-SyncId retry.
+  EnrollLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub
+        - "/captain/s3-sync/${SyncId}/${AttemptToken}/enroll"
+        - AttemptToken: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref AWS::StackId]]]]
+      RetentionInDays: 30
 
   EnrollFunctionRole:
     Type: AWS::IAM::Role
@@ -343,74 +595,142 @@ Resources:
       Handler: index.handler
       Timeout: 180
       Role: !GetAtt EnrollFunctionRole.Arn
+      # Log to the stack-owned, per-attempt log group above (NOT the default
+      # /aws/lambda/<function-name>) -- see rule 2 on
+      # SetBucketNotificationLogGroup.
+      LoggingConfig:
+        LogGroup: !Ref EnrollLogGroup
+      Environment:
+        Variables:
+          CAPTAIN_DEBUG: !Ref DebugLogging
       Code:
         ZipFile: |
           # Phone-home custom resource. POSTs the enrollment facts to Captain and
           # ALWAYS answers CloudFormation, so a failed handshake shows up in Stack
           # Events and rolls the stack back instead of hanging for an hour.
-          import json, secrets, string, urllib.request, urllib.error
+          #
+          # Heavy, structured, single-line logging under the CAPTAIN-ENROLL prefix.
+          # The one-time Secret is NEVER logged (it is redacted to its length).
+          import json, os, secrets, string, urllib.request, urllib.error
 
+          DEBUG = os.environ.get("CAPTAIN_DEBUG", "true").lower() == "true"
           ALPHABET = string.ascii_letters + string.digits
+          REDACT = ("secret",)
+
+          def log(tag, **kw):
+              if not DEBUG and tag.endswith("-debug"):
+                  return
+              safe = {}
+              for k, v in kw.items():
+                  if k in REDACT and v:
+                      safe[k] = "***redacted(len=%d)***" % len(str(v))
+                  else:
+                      safe[k] = v
+              print("CAPTAIN-ENROLL %s %s" % (tag, json.dumps(safe, default=str)))
 
           def new_deployment_id():
               # Stripe-style dep_<token>, no bare UUIDs in customer-facing output.
               return "dep_" + "".join(secrets.choice(ALPHABET) for _ in range(24))
 
           def cfn_respond(evt, ctx, status, reason, data):
+              # Answer CloudFormation. Swallow (but log) send failures: re-raising
+              # would only risk a double-send and still leaves the stack hanging.
               body = json.dumps({
                   "Status": status, "Reason": reason[:1024],
                   "PhysicalResourceId": data.get("deploymentId") or ctx.log_stream_name,
                   "StackId": evt["StackId"], "RequestId": evt["RequestId"],
                   "LogicalResourceId": evt["LogicalResourceId"], "Data": data,
               }).encode()
-              req = urllib.request.Request(
-                  evt["ResponseURL"], data=body, method="PUT",
-                  headers={"content-type": "", "content-length": str(len(body))})
-              urllib.request.urlopen(req, timeout=30)
+              log("cfn-respond", status=status, reason=reason[:200],
+                  physicalId=data.get("deploymentId"))
+              try:
+                  req = urllib.request.Request(
+                      evt["ResponseURL"], data=body, method="PUT",
+                      headers={"content-type": "", "content-length": str(len(body))})
+                  urllib.request.urlopen(req, timeout=30)
+                  log("cfn-respond-ok")
+              except Exception as e:
+                  log("cfn-respond-FAILED", error=str(e))
 
           def phone_home(url, payload):
               data = json.dumps(payload).encode()
+              log("phone-home-post", url=url, bytes=len(data),
+                  deploymentId=payload.get("deploymentId"),
+                  syncId=payload.get("syncId"), bucket=payload.get("bucket"),
+                  region=payload.get("region"), action=payload.get("action"),
+                  secret=payload.get("secret"))
               req = urllib.request.Request(
                   url, data=data, method="POST",
                   headers={"content-type": "application/json",
-                           "user-agent": "captain-cfn-enroll/2026-08-12"})
+                           "user-agent": "captain-cfn-enroll/2026-08-13"})
               # Raises on non-2xx (HTTPError) or timeout/DNS (URLError); caller
               # converts either into a CloudFormation FAILED with a clear reason.
               with urllib.request.urlopen(req, timeout=45) as resp:
                   raw = resp.read().decode("utf-8", "replace")
+                  status = getattr(resp, "status", 200)
                   try:
-                      return resp.status, json.loads(raw)
+                      parsed = json.loads(raw)
                   except Exception:
-                      return resp.status, {"raw": raw[:512]}
+                      parsed = {"raw": raw[:512]}
+                  log("phone-home-response", httpStatus=status, body=parsed)
+                  return status, parsed
+
+          def preflight(props):
+              # Human-readable validation before we touch anything. Returned
+              # problems become the CloudFormation failure Reason verbatim.
+              problems = []
+              url = props.get("CaptainCallbackUrl") or ""
+              if not url.startswith("https://"):
+                  problems.append(
+                      "CaptainCallbackUrl must be https:// (got %r)" % url[:48])
+              for key in ("BucketName", "SnsTopicArn", "RoleArn",
+                          "ExternalId", "SyncId", "Secret"):
+                  if not props.get(key):
+                      problems.append("missing required property: %s" % key)
+              return problems
 
           def handler(evt, ctx):
               rtype = evt.get("RequestType")
               props = evt.get("ResourceProperties", {})
               # Reuse the deployment id across UPDATE/DELETE (it is the physical id).
               dep_id = evt.get("PhysicalResourceId") or new_deployment_id()
-              if not dep_id.startswith("dep_"):
+              if not str(dep_id).startswith("dep_"):
                   dep_id = new_deployment_id()
-              base = {
-                  "deploymentId": dep_id,
-                  "templateVersion": "2026-08-12",
-                  "action": rtype.lower(),
-                  "stackId": evt.get("StackId"),
-                  "region": props.get("Region"),
-                  "bucket": props.get("BucketName"),
-                  "snsTopicArn": props.get("SnsTopicArn"),
-                  "roleArn": props.get("RoleArn"),
-                  "externalId": props.get("ExternalId"),
-                  "syncId": props.get("SyncId"),
-                  "secret": props.get("Secret"),
-              }
-              url = props.get("CaptainCallbackUrl")
+              log("invoke", requestType=rtype, deploymentId=dep_id,
+                  stackId=evt.get("StackId"),
+                  logStream=getattr(ctx, "log_stream_name", None))
               try:
+                  if rtype != "Delete":
+                      problems = preflight(props)
+                      if problems:
+                          reason = "Preflight failed: " + "; ".join(problems)
+                          log("preflight-failed", problems=problems)
+                          cfn_respond(evt, ctx, "FAILED", reason,
+                                      {"deploymentId": dep_id})
+                          return
+                  base = {
+                      "deploymentId": dep_id,
+                      "templateVersion": "2026-08-13",
+                      "action": rtype.lower(),
+                      "stackId": evt.get("StackId"),
+                      "partition": props.get("Partition"),
+                      "region": props.get("Region"),
+                      "bucket": props.get("BucketName"),
+                      "objectPrefix": props.get("ObjectPrefix") or "",
+                      "kmsKeyArn": props.get("KmsKeyArn") or "",
+                      "snsTopicArn": props.get("SnsTopicArn"),
+                      "roleArn": props.get("RoleArn"),
+                      "externalId": props.get("ExternalId"),
+                      "syncId": props.get("SyncId"),
+                      "secret": props.get("Secret"),
+                  }
+                  url = props.get("CaptainCallbackUrl")
                   if rtype == "Delete":
-                      # Best-effort teardown notice; never block a stack delete on it.
+                      # Best-effort teardown notice; never block a stack delete.
                       try:
                           phone_home(url, {**base, "action": "delete"})
                       except Exception as e:
-                          print("teardown notice failed (tolerated): %s" % e)
+                          log("teardown-notice-failed-tolerated", error=str(e))
                       cfn_respond(evt, ctx, "SUCCESS",
                                   "teardown notice sent", {"deploymentId": dep_id})
                       return
@@ -418,6 +738,7 @@ Resources:
                   status, resp = phone_home(url, base)
                   ok = isinstance(resp, dict) and resp.get("verified") is True
                   if 200 <= status < 300 and ok:
+                      log("verified", captainStatus=resp.get("status"))
                       cfn_respond(evt, ctx, "SUCCESS",
                                   "Captain verified enrollment",
                                   {"deploymentId": dep_id,
@@ -426,17 +747,30 @@ Resources:
                       reason = ("Captain did not confirm enrollment "
                                 "(http %s, verified=%s). Response: %s"
                                 % (status, ok, json.dumps(resp)[:400]))
-                      cfn_respond(evt, ctx, "FAILED", reason, {"deploymentId": dep_id})
+                      log("not-verified", httpStatus=status, verified=ok)
+                      cfn_respond(evt, ctx, "FAILED", reason,
+                                  {"deploymentId": dep_id})
               except urllib.error.HTTPError as e:
-                  detail = e.read().decode("utf-8", "replace")[:400] if hasattr(e, "read") else ""
+                  detail = ""
+                  try:
+                      detail = e.read().decode("utf-8", "replace")[:400]
+                  except Exception:
+                      pass
+                  log("http-error", code=e.code, detail=detail)
                   cfn_respond(evt, ctx, "FAILED",
                               "Captain callback returned HTTP %s: %s" % (e.code, detail),
                               {"deploymentId": dep_id})
               except Exception as e:
-                  # Timeout, DNS failure, bad URL: fail the deploy with the reason.
-                  cfn_respond(evt, ctx, "FAILED",
-                              "Could not reach Captain callback: %s" % e,
-                              {"deploymentId": dep_id})
+                  log("unhandled-error", error=str(e))
+                  # Never leave the stack hanging: tolerate on delete, else fail.
+                  if rtype == "Delete":
+                      cfn_respond(evt, ctx, "SUCCESS",
+                                  "delete tolerated error: %s" % e,
+                                  {"deploymentId": dep_id})
+                  else:
+                      cfn_respond(evt, ctx, "FAILED",
+                                  "Could not reach Captain callback: %s" % e,
+                                  {"deploymentId": dep_id})
 
   # Run the phone-home LAST: only enroll once the topic, policy, notification, and
   # read role all exist, so Captain's handshake tests real, finished plumbing.
@@ -450,8 +784,11 @@ Resources:
     Properties:
       ServiceToken: !GetAtt EnrollFunction.Arn
       CaptainCallbackUrl: !Ref CaptainCallbackUrl
+      Partition: !Ref AWS::Partition
       Region: !Ref AWS::Region
       BucketName: !Ref BucketName
+      ObjectPrefix: !Ref ObjectPrefix
+      KmsKeyArn: !Ref KmsKeyArn
       SnsTopicArn: !Ref CaptainSyncTopic
       RoleArn: !GetAtt CaptainReadRole.Arn
       ExternalId: !Ref ExternalId
@@ -459,6 +796,9 @@ Resources:
       Secret: !Ref Secret
 
 Outputs:
+  DeploymentId:
+    Description: Stripe-style deployment id (dep_<token>) generated during the phone-home. Use it to look up deployment state in Captain.
+    Value: !GetAtt EnrollWithCaptain.deploymentId
   SnsTopicArn:
     Description: SNS topic the bucket publishes change events to; Captain subscribes here.
     Value: !Ref CaptainSyncTopic
@@ -468,9 +808,18 @@ Outputs:
   ExternalId:
     Description: External id Captain must present when assuming the read role.
     Value: !Ref ExternalId
-  DeploymentId:
-    Description: Stripe-style deployment id (dep_<token>) generated during the phone-home.
-    Value: !GetAtt EnrollWithCaptain.deploymentId
+  SyncScope:
+    Description: What Captain can read. Whole bucket, or the prefix if one was set.
+    Value: !If
+      - HasPrefix
+      - !Sub "s3://${BucketName}/${ObjectPrefix}* (prefix-scoped)"
+      - !Sub "s3://${BucketName}/* (whole bucket)"
+  TemplateVersion:
+    Description: Date-based version of this template.
+    Value: "2026-08-13"
+  DebugLogsHere:
+    Description: CloudWatch log groups to read if a deploy fails.
+    Value: !Sub "${EnrollLogGroup} and ${SetBucketNotificationLogGroup}"
   WhatToDoNext:
     Description: One-line next step.
     Value: !Sub >-

@@ -1,0 +1,21 @@
+# Copy to terraform.tfvars and fill in (Captain normally generates this for you).
+# Operator credentials are NOT here: export them so they stay out of state.
+#
+#   export B2_APPLICATION_KEY_ID=...      # an operator key that can create keys
+#   export B2_APPLICATION_KEY=...         #   and manage notifications
+#   terraform init
+#   terraform apply
+
+sync_id     = "sync_REPLACE_ME"
+secret      = "REPLACE_WITH_16PLUS_CHAR_ENROLL_SECRET"
+bucket_name = "your-existing-b2-bucket"
+
+# Optional. Captain fills these in when it generates your command.
+# callback_url         = "https://api.runcaptain.com/v1/deploy/b2/enroll"
+# events_url           = "https://api.runcaptain.com/v1/deploy/b2/events?sync=sync_REPLACE_ME"
+# key_duration_seconds = 7776000   # 90 days, for rotation. null = non-expiring.
+
+# event_path defaults to "skip" because B2 Event Notifications are account-gated
+# by Backblaze. Set to "enabled" only after Backblaze has turned the feature on
+# for your account (see b2/NOTES.md).
+# event_path = "skip"

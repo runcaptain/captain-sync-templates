@@ -1,0 +1,26 @@
+# Copy to terraform.tfvars and fill in. Values marked "Captain fills this in" come
+# from the deploy command Captain generates for your sync.
+
+# --- Cloudflare auth (you provide) ---
+# Prefer the CLOUDFLARE_API_TOKEN env var over putting the token in a file.
+# cloudflare_api_token = "your-cloudflare-api-token"
+
+account_id  = "0000000000000000000000000000abcd" # 32 hex chars, from `wrangler whoami`
+bucket_name = "my-r2-bucket"                       # the EXISTING bucket to sync
+
+# Optional: your workers.dev subdomain, enables the keyless read proxy URL.
+# workers_subdomain = "my-team"
+
+# --- Captain enrollment (Captain fills this in) ---
+sync_id        = "sync_replaceme"
+captain_secret = "replace-with-the-16+char-enrollment-secret"
+
+# Defaults below are fine unless Captain tells you otherwise.
+# captain_ingest_url = "https://api.runcaptain.com/v1/deploy/r2/ingest"
+# captain_enroll_url = "https://api.runcaptain.com/v1/deploy/r2/enroll"
+
+# --- Optional knobs ---
+# prefix              = "docs/"     # only fire events under this key prefix
+# jurisdiction        = "default"   # default | eu | fedramp
+# read_token_ttl_days = 90          # 0 = token never expires
+# debug               = false       # true = verbose Worker logs in `wrangler tail`

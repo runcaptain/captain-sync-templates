@@ -1,0 +1,72 @@
+{
+  // ===========================================================================
+  // Captain R2 sync Worker (Wrangler path)
+  // ---------------------------------------------------------------------------
+  // This is the ONE-CLICK-equivalent path for Cloudflare. Cloudflare has no
+  // "Launch Stack" button like AWS CloudFormation, so the closest equivalent is
+  // `npx wrangler deploy` from this directory, driven by ../deploy.sh which fills
+  // in the per-sync values and runs the self-verifying phone-home for you.
+  //
+  // Values written as $CAPTAIN_* or <placeholder> are filled in by ../deploy.sh
+  // (or by Captain when it generates your deploy command). The two things you
+  // MUST set before deploying: account_id and the CAPTAIN_SECRET secret.
+  //
+  // Template version is date-based (YYYY-MM-DD). Bump TEMPLATE_VERSION and the
+  // hosted path together when the Worker contract changes.
+  // ===========================================================================
+
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "captain-r2-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-12",
+
+  // Your Cloudflare account id is supplied at deploy time via the
+  // CLOUDFLARE_ACCOUNT_ID environment variable (../deploy.sh exports it, or run
+  // `export CLOUDFLARE_ACCOUNT_ID=$(wrangler whoami ...)`). It is intentionally
+  // NOT hardcoded here so the same file works for any account.
+
+  // Turn on Workers Logs so `wrangler tail` and the dashboard show the structured
+  // debug lines this Worker emits. Head sampling at 1.0 = keep everything.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
+  // R2 bucket binding: powers the keyless read proxy and the self-test canary.
+  // bucket_name is your EXISTING bucket; this template does not create it.
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "replace-with-your-bucket"
+    }
+  ],
+
+  // Queue consumer: R2 event notifications publish to this queue, and this Worker
+  // drains it. Create the queue first with:
+  //   wrangler queues create captain-r2-sync
+  // max_retries + dead_letter_queue mean a persistently failing Captain ingest
+  // parks messages instead of looping forever; reconcile still covers them.
+  "queues": {
+    "consumers": [
+      {
+        "queue": "captain-r2-sync",
+        "max_batch_size": 100,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "captain-r2-sync-dlq"
+      }
+    ]
+  },
+
+  // Plaintext vars (safe to show). deploy.sh overrides these per sync.
+  // CAPTAIN_SECRET is NOT here: it is a secret, set via `wrangler secret put`.
+  "vars": {
+    "TEMPLATE_VERSION": "2026-08-12",
+    "SYNC_ID": "sync_replaceme",
+    "BUCKET_NAME": "replace-with-your-bucket",
+    "ACCOUNT_ID": "",
+    "CAPTAIN_INGEST_URL": "https://api.runcaptain.com/v1/deploy/r2/ingest",
+    "CAPTAIN_ENROLL_URL": "https://api.runcaptain.com/v1/deploy/r2/enroll",
+    "DEBUG": "false"
+  }
+}

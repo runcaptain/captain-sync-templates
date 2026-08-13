@@ -1,0 +1,25 @@
+# Copy to terraform.tfvars and fill in (Captain normally generates this for you
+# with every value pre-filled).
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#   terraform init
+#   terraform apply
+
+project_id  = "your-gcp-project"
+bucket_name = "your-existing-gcs-bucket"
+
+# Captain fills these in when it generates your deploy command.
+sync_id                        = "sync_REPLACE_ME"
+enrollment_secret              = "REPLACE_WITH_16PLUS_CHAR_ENROLL_SECRET"
+external_id                    = "REPLACE_WITH_8PLUS_CHAR_EXTERNAL_ID"
+captain_reader_service_account = "captain-reader@captain-prod.iam.gserviceaccount.com"
+
+# Optional. Defaults shown; Captain overrides them per-sync when needed.
+# captain_ingest_url = "https://api.runcaptain.com/v1/deploy/gcp/gcs/ingest"
+# captain_enroll_url = "https://api.runcaptain.com/v1/deploy/gcp/gcs/enroll"
+# oidc_audience      = ""        # empty = use captain_ingest_url as the audience
+
+# Optional wiring knobs.
+# event_types        = ["OBJECT_FINALIZE", "OBJECT_DELETE", "OBJECT_METADATA_UPDATE", "OBJECT_ARCHIVE"]
+# object_name_prefix = ""        # only notify for objects under this prefix
+# manage_apis        = true      # set false if your org enables APIs centrally

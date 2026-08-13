@@ -1,0 +1,14 @@
+# Worker build + deps
+worker/node_modules/
+worker/dist/
+worker/wrangler.generated.jsonc
+worker/.wrangler/
+
+# Terraform / OpenTofu
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.*
+terraform/*.tfvars
+!terraform/terraform.tfvars.example
+terraform/tfplan

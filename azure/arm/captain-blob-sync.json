@@ -1,0 +1,282 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "_generator": {
+      "name": "bicep",
+      "version": "0.46.1.21595",
+      "templateHash": "17931388503740317956"
+    },
+    "captainTemplateVersion": "2026-08-12"
+  },
+  "parameters": {
+    "templateVersion": {
+      "type": "string",
+      "defaultValue": "2026-08-12",
+      "metadata": {
+        "description": "Template version (date-based YYYY-MM-DD). Sent to Captain on enroll so it knows which contract this deployment speaks. Do not change by hand."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region. MUST equal the region of the storage account you are syncing (an Event Grid storage system topic has to live in the same region as its account). Defaults to this resource group's region. Captain fills this in."
+      }
+    },
+    "storageAccountName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 24,
+      "metadata": {
+        "description": "Existing storage account to sync. Must already exist in THIS resource group. 3-24 chars, lowercase letters and numbers only. This template does not create it."
+      }
+    },
+    "containerName": {
+      "type": "string",
+      "defaultValue": "",
+      "maxLength": 63,
+      "metadata": {
+        "description": "Optional: restrict the sync to a single blob container by name. Leave EMPTY to sync every container in the account. When set, Event Grid only notifies Captain about blobs under this container. 3-63 chars, lowercase."
+      }
+    },
+    "captainEventWebhookUrl": {
+      "type": "string",
+      "metadata": {
+        "description": "Captain Event Grid ingest webhook (HTTPS). Event Grid delivers BlobCreated / BlobDeleted events here and runs its 30-second validation handshake against it at create time. Captain pre-fills this with a per-sync routing token. Must be https. Captain fills this in."
+      }
+    },
+    "captainEnrollUrl": {
+      "type": "string",
+      "defaultValue": "https://api.runcaptain.com/v1/deploy/azure/blob/enroll",
+      "metadata": {
+        "description": "Captain enrollment endpoint (HTTPS) the phone-home deployment script POSTs the enrollment facts to. Captain verifies event delivery + read access and returns verified:true. Must be https. Captain fills this in."
+      }
+    },
+    "captainPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Object id (GUID) of Captain's service principal AS IT EXISTS IN YOUR TENANT after you grant admin consent to the Captain enterprise application. The read role is assigned to this principal. Captain fills this in once consent is complete. This is a keyless, cross-tenant grant: Captain reads with a token for its own identity, never a key or SAS from your account."
+      }
+    },
+    "captainTenantId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Captain's home Azure AD tenant id (GUID). Sent to Captain on enroll for its records; not used to grant access. Captain fills this in."
+      }
+    },
+    "syncId": {
+      "type": "string",
+      "metadata": {
+        "description": "Captain sync id this deployment enrolls, form sync_<token>. Captain fills this in."
+      }
+    },
+    "secret": {
+      "type": "securestring",
+      "metadata": {
+        "description": "One-time enrollment secret minted by Captain for this sync. POSTed to the enroll endpoint so Captain can bind this deployment to your sync. Write-only (secure); never surfaced in outputs or logs. Captain fills this in."
+      }
+    }
+  },
+  "variables": {
+    "storageBlobDataReaderRoleId": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
+    "syncSlug": "[replace(parameters('syncId'), '_', '-')]",
+    "systemTopicName": "[format('captain-blob-{0}', variables('syncSlug'))]",
+    "eventSubscriptionName": "[format('captain-sub-{0}', variables('syncSlug'))]",
+    "enrollScriptName": "[format('captain-enroll-{0}', variables('syncSlug'))]",
+    "subjectPrefix": "[if(empty(parameters('containerName')), '', format('/blobServices/default/containers/{0}/', parameters('containerName')))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.EventGrid/systemTopics",
+      "apiVersion": "2022-06-15",
+      "name": "[variables('systemTopicName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "source": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+        "topicType": "Microsoft.Storage.StorageAccounts"
+      },
+      "tags": {
+        "captain:sync-id": "[parameters('syncId')]",
+        "captain:managed-by": "bicep"
+      }
+    },
+    {
+      "type": "Microsoft.EventGrid/systemTopics/eventSubscriptions",
+      "apiVersion": "2022-06-15",
+      "name": "[format('{0}/{1}', variables('systemTopicName'), variables('eventSubscriptionName'))]",
+      "properties": {
+        "destination": {
+          "endpointType": "WebHook",
+          "properties": {
+            "endpointUrl": "[parameters('captainEventWebhookUrl')]",
+            "maxEventsPerBatch": 1,
+            "preferredBatchSizeInKilobytes": 64
+          }
+        },
+        "filter": {
+          "includedEventTypes": [
+            "Microsoft.Storage.BlobCreated",
+            "Microsoft.Storage.BlobDeleted"
+          ],
+          "subjectBeginsWith": "[variables('subjectPrefix')]",
+          "enableAdvancedFilteringOnArrays": true
+        },
+        "eventDeliverySchema": "EventGridSchema",
+        "retryPolicy": {
+          "maxDeliveryAttempts": 30,
+          "eventTimeToLiveInMinutes": 1440
+        }
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.EventGrid/systemTopics', variables('systemTopicName'))]"
+      ]
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "scope": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+      "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('captainPrincipalId'), variables('storageBlobDataReaderRoleId'))]",
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageBlobDataReaderRoleId'))]",
+        "principalId": "[parameters('captainPrincipalId')]",
+        "principalType": "ServicePrincipal",
+        "description": "[format('Read-only blob access for Captain sync {0}.', parameters('syncId'))]"
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deploymentScripts",
+      "apiVersion": "2020-10-01",
+      "name": "[variables('enrollScriptName')]",
+      "location": "[parameters('location')]",
+      "kind": "AzureCLI",
+      "properties": {
+        "azCliVersion": "2.60.0",
+        "retentionInterval": "PT1H",
+        "timeout": "PT30M",
+        "cleanupPreference": "OnSuccess",
+        "environmentVariables": [
+          {
+            "name": "CAPTAIN_ENROLL_URL",
+            "value": "[parameters('captainEnrollUrl')]"
+          },
+          {
+            "name": "TEMPLATE_VERSION",
+            "value": "[parameters('templateVersion')]"
+          },
+          {
+            "name": "SYNC_ID",
+            "value": "[parameters('syncId')]"
+          },
+          {
+            "name": "SECRET",
+            "secureValue": "[parameters('secret')]"
+          },
+          {
+            "name": "SUBSCRIPTION_ID",
+            "value": "[subscription().subscriptionId]"
+          },
+          {
+            "name": "TENANT_ID",
+            "value": "[tenant().tenantId]"
+          },
+          {
+            "name": "CAPTAIN_TENANT_ID",
+            "value": "[parameters('captainTenantId')]"
+          },
+          {
+            "name": "RESOURCE_GROUP",
+            "value": "[resourceGroup().name]"
+          },
+          {
+            "name": "STORAGE_ACCOUNT_ID",
+            "value": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+          },
+          {
+            "name": "STORAGE_ACCOUNT_NAME",
+            "value": "[parameters('storageAccountName')]"
+          },
+          {
+            "name": "CONTAINER_NAME",
+            "value": "[parameters('containerName')]"
+          },
+          {
+            "name": "SYSTEM_TOPIC",
+            "value": "[variables('systemTopicName')]"
+          },
+          {
+            "name": "EVENT_SUBSCRIPTION",
+            "value": "[variables('eventSubscriptionName')]"
+          },
+          {
+            "name": "EVENT_WEBHOOK_URL",
+            "value": "[parameters('captainEventWebhookUrl')]"
+          },
+          {
+            "name": "PRINCIPAL_ID",
+            "value": "[parameters('captainPrincipalId')]"
+          },
+          {
+            "name": "ROLE_ASSIGNMENT_ID",
+            "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('captainPrincipalId'), variables('storageBlobDataReaderRoleId')))]"
+          },
+          {
+            "name": "LOCATION",
+            "value": "[parameters('location')]"
+          }
+        ],
+        "scriptContent": "set -euo pipefail\n\necho \"==================================================================\"\necho \" Captain Azure Blob enroll (self-verifying phone-home)\"\necho \"==================================================================\"\necho \"template_version : ${TEMPLATE_VERSION}\"\necho \"sync_id          : ${SYNC_ID}\"\necho \"subscription     : ${SUBSCRIPTION_ID}\"\necho \"resource_group   : ${RESOURCE_GROUP}\"\necho \"storage_account  : ${STORAGE_ACCOUNT_NAME}\"\necho \"container_filter : ${CONTAINER_NAME:-<all containers>}\"\necho \"system_topic     : ${SYSTEM_TOPIC}\"\necho \"event_sub        : ${EVENT_SUBSCRIPTION}\"\necho \"event_webhook    : ${EVENT_WEBHOOK_URL}\"\necho \"captain_principal: ${PRINCIPAL_ID}\"\necho \"role_assignment  : ${ROLE_ASSIGNMENT_ID}\"\necho \"enroll_url       : ${CAPTAIN_ENROLL_URL}\"\necho \"------------------------------------------------------------------\"\n\n# -- Preflight: never send the enrollment secret over plaintext -------------\ncase \"${CAPTAIN_ENROLL_URL}\" in\n  https://*) echo \"preflight: enroll URL is https, ok\" ;;\n  *) echo \"PREFLIGHT FAILED: CAPTAIN_ENROLL_URL must be https:// (refusing to POST the enrollment secret in the clear). Got: ${CAPTAIN_ENROLL_URL}\"; exit 1 ;;\nesac\ncase \"${EVENT_WEBHOOK_URL}\" in\n  https://*) echo \"preflight: event webhook is https, ok\" ;;\n  *) echo \"PREFLIGHT WARNING: EVENT_WEBHOOK_URL is not https (${EVENT_WEBHOOK_URL}). Event Grid requires https for the validation handshake; the event subscription step should already have failed if so.\" ;;\nesac\n\n# -- Stripe-style deployment id, no bare UUID --------------------------------\n# python3 secrets.token_hex(12) writes exactly 24 hex chars and exits 0 on its\n# own; no pipe into head, so there is nothing here for pipefail to trip over.\n# python3 is already a hard dependency of this script (used below to build the\n# JSON payload), so this adds no new tool. (A prior version piped /dev/urandom\n# through tr into head -c 24: head closes the pipe once it has its 24 bytes,\n# the upstream cat/tr get SIGPIPE, and set -euo pipefail aborted the whole\n# script before it ever reached the phone-home POST below. openssl was\n# considered as the replacement but is NOT present in the pinned\n# mcr.microsoft.com/azure-cli:2.60.0 image (Alpine base, no openssl binary),\n# so it was rejected in favor of python3. Audited: this is the only\n# urandom/head pipeline in this script.)\nTOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(12))')\nexport DEP_ID=\"dep_${TOKEN}\"\necho \"deployment_id    : ${DEP_ID}\"\n\n# -- Build the payload with python3 (keeps the secret out of the arg list) ---\nPAYLOAD=$(python3 - <<'PY'\nimport json, os\nprint(json.dumps({\n    \"deploymentId\":        os.environ[\"DEP_ID\"],\n    \"templateVersion\":     os.environ.get(\"TEMPLATE_VERSION\", \"\"),\n    \"action\":              \"create\",\n    \"cloud\":               \"azure\",\n    \"provider\":            \"blob\",\n    \"subscriptionId\":      os.environ.get(\"SUBSCRIPTION_ID\", \"\"),\n    \"tenantId\":            os.environ.get(\"TENANT_ID\", \"\"),\n    \"captainTenantId\":     os.environ.get(\"CAPTAIN_TENANT_ID\", \"\"),\n    \"resourceGroup\":       os.environ.get(\"RESOURCE_GROUP\", \"\"),\n    \"storageAccountId\":    os.environ.get(\"STORAGE_ACCOUNT_ID\", \"\"),\n    \"storageAccountName\":  os.environ.get(\"STORAGE_ACCOUNT_NAME\", \"\"),\n    \"containerName\":       os.environ.get(\"CONTAINER_NAME\", \"\"),\n    \"systemTopic\":         os.environ.get(\"SYSTEM_TOPIC\", \"\"),\n    \"eventSubscription\":   os.environ.get(\"EVENT_SUBSCRIPTION\", \"\"),\n    \"eventWebhookUrl\":     os.environ.get(\"EVENT_WEBHOOK_URL\", \"\"),\n    \"captainPrincipalId\":  os.environ.get(\"PRINCIPAL_ID\", \"\"),\n    \"roleAssignmentId\":    os.environ.get(\"ROLE_ASSIGNMENT_ID\", \"\"),\n    \"location\":            os.environ.get(\"LOCATION\", \"\"),\n    \"syncId\":              os.environ.get(\"SYNC_ID\", \"\"),\n    \"secret\":              os.environ.get(\"SECRET\", \"\"),\n}))\nPY\n)\n\necho \"phone-home: POST ${CAPTAIN_ENROLL_URL} (payload omits secret from this log)\"\n\n# POST with python3's stdlib rather than curl. curl is NOT present in the\n# pinned mcr.microsoft.com/azure-cli:2.60.0 image (it is Alpine-based and only\n# ships wget), so a curl call here would fail \"command not found\" on every\n# real run, get swallowed by a `|| echo \"000\"` fallback, and permanently\n# masquerade as \"Captain did not verify\" even when Captain is healthy. That\n# is the same class of bug as the token generator: the phone-home, the entire\n# point of this artifact, silently never reaches Captain. python3 is already\n# a hard dependency of this script (used above and below to build/parse\n# JSON), so this adds no new tool.\nHTTP_CODE=$(PAYLOAD=\"${PAYLOAD}\" python3 - <<'PY'\nimport os\nimport urllib.error\nimport urllib.request\n\nurl = os.environ[\"CAPTAIN_ENROLL_URL\"]\npayload = os.environ[\"PAYLOAD\"].encode(\"utf-8\")\nheaders = {\n    \"content-type\": \"application/json\",\n    \"user-agent\": \"captain-azure-enroll/\" + os.environ.get(\"TEMPLATE_VERSION\", \"\"),\n}\nreq = urllib.request.Request(url, data=payload, headers=headers, method=\"POST\")\ntry:\n    with urllib.request.urlopen(req, timeout=45) as resp:\n        body, code = resp.read(), resp.getcode()\nexcept urllib.error.HTTPError as e:\n    body, code = e.read(), e.code\nexcept Exception:\n    body, code = b\"\", 0\n\nwith open(\"/tmp/captain_resp.json\", \"wb\") as f:\n    f.write(body)\nprint(code)\nPY\n)\n\necho \"captain_http_status : ${HTTP_CODE}\"\necho \"captain_response    : $(head -c 800 /tmp/captain_resp.json 2>/dev/null || true)\"\necho \"------------------------------------------------------------------\"\n\n# -- Parse verified + status from Captain's response -------------------------\n# `verified` is the ONLY success signal. `status` is display-only text and\n# must never gate success on its own: a response like {\"verified\": true,\n# \"status\": \"\"} is a real, plausible in-progress/edge shape from Captain, and\n# `d.get('status', 'verified')` would wrongly return \"\" for it (the key IS\n# present, just empty, so the dict default never kicks in). That used to make\n# CAPTAIN_STATUS empty even though Captain said verified:true, which failed\n# the deployment and printed a misleading \"verified : false\" right next to\n# the raw response proving otherwise. Fixed by parsing verified and status as\n# two independent fields: status falls back to 'verified' whenever it is\n# either absent OR falsy/empty, but only verified decides success.\n#\n# `status` can ALSO come back as any other JSON type: a number, null, a bool,\n# a list, or a nested object. Nothing in Captain's contract promises it is\n# always a string. The naive `('1'|'0') + '|' + status` concat throws\n# TypeError for any non-string, truthy status (a number, `true`, a non-empty\n# list/object) because Python never implicitly stringifies on `+`. That\n# TypeError used to be swallowed whole by a blanket `except Exception:\n# print('0|')`, so a live Captain returning e.g. {\"verified\": true, \"status\":\n# 200} silently came out as verified:false with zero indication why: same\n# bytes on the wire as a genuine failure. Live-reproduced (see NOTES.md) and\n# fixed by coercing `status` to a string for every JSON type BEFORE the\n# concat, and by explicitly checking the top-level shape is an object at all\n# rather than relying on the exception handler to catch it.\nCAPTAIN_PARSED=\"$(python3 - <<'PY'\nimport json\n\ndef coerce_status(value):\n    # Defensive coercion: status is documented as text, but nothing stops\n    # Captain (or a proxy/WAF in front of it) from sending a number, null, a\n    # bool, a list, or a nested object. Every JSON type becomes a readable\n    # string here instead of crashing the '+' concat below.\n    if value is None:\n        return ''\n    if isinstance(value, str):\n        return value\n    try:\n        return json.dumps(value)\n    except Exception:\n        return str(value)\n\ntry:\n    d = json.load(open('/tmp/captain_resp.json'))\nexcept Exception:\n    print('0|<unparseable response body>')\nelse:\n    if not isinstance(d, dict):\n        print('0|<unexpected response shape: top-level JSON is ' + type(d).__name__ + ', not an object>')\n    else:\n        verified = d.get('verified') is True\n        raw_status = coerce_status(d.get('status'))\n        status = (raw_status or 'verified') if verified else (raw_status or '')\n        print(('1' if verified else '0') + '|' + status)\nPY\n)\"\nexport CAPTAIN_VERIFIED=\"${CAPTAIN_PARSED%%|*}\"\nexport CAPTAIN_STATUS=\"${CAPTAIN_PARSED#*|}\"\n\nif [ \"${HTTP_CODE}\" -ge 200 ] && [ \"${HTTP_CODE}\" -lt 300 ] && [ \"${CAPTAIN_VERIFIED}\" = \"1\" ]; then\n  echo \"SUCCESS: Captain verified enrollment (event delivery handshake + read-access probe both passed).\"\n  python3 - <<'PY'\nimport json, os\njson.dump({\n    \"deploymentId\": os.environ[\"DEP_ID\"],\n    \"captainStatus\": os.environ.get(\"CAPTAIN_STATUS\", \"verified\"),\n    \"syncId\": os.environ.get(\"SYNC_ID\", \"\"),\n}, open(os.environ[\"AZ_SCRIPTS_OUTPUT_PATH\"], \"w\"))\nPY\n  echo \"deployment_id=${DEP_ID}\"\n  echo \"==================================================================\"\nelse\n  echo \"==================================================================\"\n  echo \" ENROLLMENT NOT CONFIRMED BY CAPTAIN. Deployment is failing on\"\n  echo \" purpose so you see this now, not three days later on a dead sync.\"\n  echo \"------------------------------------------------------------------\"\n  echo \" http_status : ${HTTP_CODE}\"\n  echo \" verified    : $( [ \"${CAPTAIN_VERIFIED}\" = \"1\" ] && echo true || echo false )\"\n  echo \" status      : ${CAPTAIN_STATUS:-<none>}\"\n  echo \" response    : $(head -c 800 /tmp/captain_resp.json 2>/dev/null || true)\"\n  echo \"------------------------------------------------------------------\"\n  echo \" Common causes:\"\n  echo \"  - captainPrincipalId is wrong or admin consent for the Captain app\"\n  echo \"    was never granted -> Captain's read probe cannot get a token.\"\n  echo \"  - role assignment has not propagated yet (Azure AD can take a few\"\n  echo \"    minutes) -> Captain retries the probe; re-run if it timed out.\"\n  echo \"  - enroll URL or secret does not match this sync -> HTTP 401/403/404.\"\n  echo \"  - Event Grid RP not registered / webhook handshake failed earlier.\"\n  echo \" See azure/README.md 'Debugging a failed deploy' for the full list.\"\n  echo \"==================================================================\"\n  exit 1\nfi\n"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.EventGrid/systemTopics/eventSubscriptions', variables('systemTopicName'), variables('eventSubscriptionName'))]",
+        "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('captainPrincipalId'), variables('storageBlobDataReaderRoleId')))]",
+        "[resourceId('Microsoft.EventGrid/systemTopics', variables('systemTopicName'))]"
+      ]
+    }
+  ],
+  "outputs": {
+    "deploymentId": {
+      "type": "string",
+      "metadata": {
+        "description": "Stripe-style deployment id (dep_<token>) generated during the phone-home. Use it to look up deployment state and debug in Captain."
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deploymentScripts', variables('enrollScriptName')), '2020-10-01').outputs.deploymentId]"
+    },
+    "captainStatus": {
+      "type": "string",
+      "metadata": {
+        "description": "Captain-reported enrollment status for this deployment."
+      },
+      "value": "[reference(resourceId('Microsoft.Resources/deploymentScripts', variables('enrollScriptName')), '2020-10-01').outputs.captainStatus]"
+    },
+    "readRoleAssignmentId": {
+      "type": "string",
+      "metadata": {
+        "description": "Resource id of the cross-tenant read role assignment Captain uses."
+      },
+      "value": "[extensionResourceId(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), 'Microsoft.Authorization/roleAssignments', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), parameters('captainPrincipalId'), variables('storageBlobDataReaderRoleId')))]"
+    },
+    "systemTopicName": {
+      "type": "string",
+      "metadata": {
+        "description": "Event Grid system topic created on the storage account."
+      },
+      "value": "[variables('systemTopicName')]"
+    },
+    "eventSubscriptionName": {
+      "type": "string",
+      "metadata": {
+        "description": "Event Grid webhook event subscription that delivers change events to Captain."
+      },
+      "value": "[variables('eventSubscriptionName')]"
+    },
+    "whatToDoNext": {
+      "type": "string",
+      "metadata": {
+        "description": "One-line next step."
+      },
+      "value": "[format('Deployment {0} is enrolled and verified. Open your Captain dashboard for sync {1}: a targeted reconcile of {2} runs automatically and future blob changes sync near-real-time.', reference(resourceId('Microsoft.Resources/deploymentScripts', variables('enrollScriptName')), '2020-10-01').outputs.deploymentId, parameters('syncId'), parameters('storageAccountName'))]"
+    }
+  }
+}
