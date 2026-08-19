@@ -150,6 +150,11 @@ push_sa_id_for_sync() { printf 'cap-push-%s' "$(sha256_hex "$1" | cut -c1-16)"; 
 
 TOPIC="captain-gcs-sync-${SYNC_ID}"
 SUB="captain-gcs-push-${SYNC_ID}"
+# GCP label VALUES must be lowercase; sync_id may contain uppercase
+# (^sync_[A-Za-z0-9]+$), which would make `--labels=captain-sync-id=<sync_id>`
+# invalid and fail topic/subscription creation. Lowercase it for the label only;
+# the exact sync id still lives in the resource names and custom-attributes.
+SYNC_ID_LABEL="$(printf '%s' "$SYNC_ID" | tr '[:upper:]' '[:lower:]')"
 PUSH_SA_ID="$(push_sa_id_for_sync "$SYNC_ID")"
 PUSH_SA_EMAIL="${PUSH_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 DEPLOYMENT_ID="dep_$(rand 24)"
@@ -179,7 +184,7 @@ if gcloud pubsub topics describe "$TOPIC" --project="$PROJECT_ID" >/dev/null 2>&
   log "topic $TOPIC already exists, reusing"
 else
   run gcloud pubsub topics create "$TOPIC" --project="$PROJECT_ID" \
-    --labels="captain-sync-id=${SYNC_ID},captain-managed-by=gcloud"
+    --labels="captain-sync-id=${SYNC_ID_LABEL},captain-managed-by=gcloud"
 fi
 step "Let the GCS service agent publish to the topic"
 run gcloud pubsub topics add-iam-policy-binding "$TOPIC" --project="$PROJECT_ID" \
@@ -251,7 +256,7 @@ else
     --message-retention-duration=7d \
     --expiration-period=never \
     --min-retry-delay=10s --max-retry-delay=600s \
-    --labels="captain-sync-id=${SYNC_ID},captain-managed-by=gcloud"
+    --labels="captain-sync-id=${SYNC_ID_LABEL},captain-managed-by=gcloud"
 fi
 
 # ---- 4. cross-account read grant (no long-lived keys) ------------------------

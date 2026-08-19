@@ -47,8 +47,14 @@ locals {
   # Effective OIDC audience: default to the ingest URL when not overridden.
   oidc_audience = var.oidc_audience != "" ? var.oidc_audience : var.captain_ingest_url
 
+  # GCP resource-label VALUES must be lowercase (letters/digits/underscore/hyphen).
+  # sync_id's charset allows uppercase (^sync_[A-Za-z0-9]+$), so a mixed-case sync
+  # id would make the topic/subscription label value invalid and fail `apply`.
+  # The exact sync id still lives verbatim in the resource NAMES and in the
+  # notification custom_attributes (neither of which is case-restricted); the
+  # label is only a human correlation aid, so lowercasing it here is safe.
   common_labels = merge(var.labels, {
-    "captain-sync-id"    = var.sync_id
+    "captain-sync-id"    = lower(var.sync_id)
     "captain-managed-by" = "terraform"
   })
 }
@@ -230,6 +236,24 @@ resource "google_storage_bucket_iam_member" "captain_reader" {
 # resources; Captain detects the dead event source and the reconcile backstop
 # keeps the sync consistent.
 resource "terraform_data" "enroll" {
+  # triggers_replace (NOT input) is what forces the create-time provisioner to
+  # re-run. A `terraform_data` whose `input` changes is updated IN PLACE, and an
+  # in-place update does NOT re-run provisioners, so registering only through
+  # `input` would fire enroll.sh on the FIRST apply and never again, even after
+  # the sync id, ingest URL, API base, or API key changed. Putting the same
+  # facts in triggers_replace makes any change replace the resource, which re-runs
+  # the `when = create` provisioner. Verified empirically: input-only => "updated
+  # in-place" (no re-run); triggers_replace => "must be replaced" (re-runs).
+  # Idempotency is preserved: unchanged facts => no replacement => no re-run.
+  triggers_replace = {
+    api_base         = var.captain_api_base
+    sync_id          = var.sync_id
+    ingest_url       = var.captain_ingest_url
+    deployment_id    = local.deployment_id
+    template_version = local.template_version
+    api_key          = var.captain_api_key
+  }
+
   input = {
     api_base         = var.captain_api_base
     sync_id          = var.sync_id
