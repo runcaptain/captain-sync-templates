@@ -50,7 +50,7 @@
 
 targetScope = 'resourceGroup'
 
-metadata captainTemplateVersion = '2026-08-13'
+metadata captainTemplateVersion = '2026-09-07'
 
 // ---------------------------------------------------------------------------
 // Parameters. Everything tagged "Captain fills this in" is pre-filled by
@@ -58,7 +58,7 @@ metadata captainTemplateVersion = '2026-08-13'
 // ---------------------------------------------------------------------------
 
 @description('Template version (date-based YYYY-MM-DD). Reported in the phone-home user-agent so Captain knows which contract this deployment speaks. Do not change by hand.')
-param templateVersion string = '2026-08-13'
+param templateVersion string = '2026-09-07'
 
 @description('Azure region. MUST equal the region of the storage account you are syncing (an Event Grid storage system topic has to live in the same region as its account). Defaults to this resource group\'s region. Captain fills this in.')
 param location string = resourceGroup().location
@@ -72,6 +72,9 @@ param storageAccountName string
 @maxLength(63)
 param containerName string = ''
 
+@description('Optional: further restrict events to blob names starting with this prefix (e.g. docs/2026/). Only meaningful when containerName is set. Match it to the sync\'s prefix in Captain so a busy container does not spend Captain\'s per-connector event budget on out-of-scope blobs.')
+param blobPrefix string = ''
+
 @description('Captain Event Grid ingest webhook (HTTPS). This is the subscribe_url Captain mints for your sync when the webhook is enrolled (POST {captainApiBase}/v2/syncs/<syncId>/webhooks). Event Grid delivers BlobCreated / BlobDeleted events here and runs its 30-second validation handshake against it at create time. Must be https. Captain fills this in.')
 param captainEventWebhookUrl string
 
@@ -82,11 +85,14 @@ param captainApiBase string = 'https://api.captain.dev'
 @secure()
 param captainApiKey string
 
-@description('Object id (GUID) of Captain\'s service principal AS IT EXISTS IN YOUR TENANT after you grant admin consent to the Captain enterprise application. The read role is assigned to this principal. Captain fills this in once consent is complete. This is a keyless, cross-tenant grant: Captain reads with a token for its own identity, never a key or SAS from your account.')
-param captainPrincipalId string
+@description('OPTIONAL (keyless mode only): object id (GUID) of Captain\'s service principal AS IT EXISTS IN YOUR TENANT after you grant admin consent to the Captain enterprise application. Leave EMPTY for account-key syncs (the default): Captain then reads with the storage account key you gave it at sync creation and no role assignment is created. When set, a keyless cross-tenant Storage Blob Data Reader grant is added for that principal.')
+param captainPrincipalId string = ''
 
 @description('Captain sync id this deployment enrolls, form sync_<token>. Captain fills this in.')
 param syncId string
+
+@description('Leave the default. Changes on every deployment (utcNow) and is wired to the enrollment script\'s forceUpdateTag so a REDEPLOY re-runs the phone-home verification — without it, ARM skips a deploymentScript whose properties are unchanged and a redeploy would not re-verify anything.')
+param deployTimestamp string = utcNow()
 
 // ---------------------------------------------------------------------------
 // Fixed values and derived names.
@@ -108,7 +114,9 @@ var enrollScriptName = 'captain-enroll-${syncSlug}'
 //   /blobServices/default/containers/<container>/blobs/<path>
 // so a container filter is a subjectBeginsWith prefix. Empty container = no
 // filter = whole account.
-var subjectPrefix = empty(containerName) ? '' : '/blobServices/default/containers/${containerName}/'
+var subjectPrefix = empty(containerName) ? '' : (empty(blobPrefix)
+  ? '/blobServices/default/containers/${containerName}/'
+  : '/blobServices/default/containers/${containerName}/blobs/${blobPrefix}')
 
 // ---------------------------------------------------------------------------
 // Existing storage account. Referencing it by name makes the deployment FAIL
@@ -188,7 +196,7 @@ resource eventSubscription 'Microsoft.EventGrid/systemTopics/eventSubscriptions@
 // Storage Blob Data Reader for Captain's service principal, scoped to exactly
 // this one storage account. principalType is pinned to ServicePrincipal so the
 // assignment does not fail while Azure AD replicates a just-consented principal.
-resource readGrant 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource readGrant 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(captainPrincipalId)) {
   name: guid(storage.id, captainPrincipalId, storageBlobDataReaderRoleId)
   scope: storage
   properties: {
@@ -221,6 +229,7 @@ resource enroll 'Microsoft.Resources/deploymentScripts@2020-10-01' = {
   // is needed (and adding one trips the no-unnecessary-dependson linter).
   properties: {
     azCliVersion: '2.60.0'
+    forceUpdateTag: deployTimestamp
     retentionInterval: 'PT1H'
     timeout: 'PT30M'
     cleanupPreference: 'OnSuccess'
@@ -237,7 +246,7 @@ resource enroll 'Microsoft.Resources/deploymentScripts@2020-10-01' = {
       { name: 'EVENT_SUBSCRIPTION', value: eventSubscription.name }
       { name: 'EVENT_WEBHOOK_URL', value: captainEventWebhookUrl }
       { name: 'PRINCIPAL_ID', value: captainPrincipalId }
-      { name: 'ROLE_ASSIGNMENT_ID', value: readGrant.id }
+      { name: 'ROLE_ASSIGNMENT_ID', value: empty(captainPrincipalId) ? '<none: account-key sync>' : readGrant.id }
       { name: 'LOCATION', value: location }
     ]
     scriptContent: '''
@@ -333,10 +342,11 @@ echo "captain_response    : $(head -c 800 /tmp/captain_resp.json 2>/dev/null || 
 echo "------------------------------------------------------------------"
 
 # -- Parse Captain's response -------------------------------------------------
-# Contract: a 2xx JSON object with subscribe_url (string), secret_set (bool),
-# and instructions (array of strings). A 2xx with a subscribe_url IS
-# successful enrollment; subscribe_url is the ONLY success signal here.
-# secret_set and instructions are display-only and never gate success.
+# Contract (verified against the live API, 2026-09-07): a 2xx JSON object with
+# ingest_url (string), secret_set (bool), and instructions (array of strings).
+# A 2xx with an ingest_url IS successful enrollment; ingest_url is the ONLY
+# success signal here (subscribe_url is accepted as a legacy alias). secret_set
+# and instructions are display-only and never gate success.
 #
 # Parsing is deliberately defensive: nothing stops a proxy/WAF in front of
 # Captain from sending non-JSON, a non-object top level, or unexpected field
@@ -366,11 +376,11 @@ else:
     if not isinstance(d, dict):
         note = '<unexpected response shape: top-level JSON is ' + type(d).__name__ + ', not an object>'
     else:
-        raw = d.get('subscribe_url')
+        raw = d.get('ingest_url') or d.get('subscribe_url')
         if isinstance(raw, str) and raw:
             ok, sub = '1', raw
         else:
-            note = '<response has no usable subscribe_url>'
+            note = '<response has no usable ingest_url>'
         if d.get('secret_set') is True:
             secret_set = 'true'
         elif d.get('secret_set') is False:
@@ -392,13 +402,13 @@ CAPTAIN_NOTE="$(cat /tmp/captain_note)"
 export SUBSCRIBE_URL SECRET_SET
 
 if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ] && [ "${CAPTAIN_OK}" = "1" ]; then
-  echo "SUCCESS: Captain enrolled the webhook for ${SYNC_ID} (2xx with subscribe_url)."
-  echo "subscribe_url : ${SUBSCRIBE_URL}"
+  echo "SUCCESS: Captain enrolled the webhook for ${SYNC_ID} (2xx with ingest_url)."
+  echo "ingest_url    : ${SUBSCRIBE_URL}"
   echo "secret_set    : ${SECRET_SET}"
   if [ "${SUBSCRIBE_URL}" != "${EVENT_WEBHOOK_URL}" ]; then
-    echo "NOTE: the subscribe_url Captain returned differs from captainEventWebhookUrl."
+    echo "NOTE: the ingest_url Captain returned differs from captainEventWebhookUrl."
     echo "      The event subscription delivers to captainEventWebhookUrl. If events do"
-    echo "      not flow, redeploy with captainEventWebhookUrl set to the subscribe_url"
+    echo "      not flow, redeploy with captainEventWebhookUrl set to the ingest_url"
     echo "      above. Reconcile remains the backstop either way."
   fi
   if [ -s /tmp/captain_instructions ]; then
@@ -409,7 +419,7 @@ if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ] && [ "${CAPTAIN_OK}"
 import json, os
 json.dump({
     "deploymentId": os.environ["DEP_ID"],
-    "subscribeUrl": os.environ.get("SUBSCRIBE_URL", ""),
+    "ingestUrl": os.environ.get("SUBSCRIBE_URL", ""),
     "secretSet": os.environ.get("SECRET_SET", "unknown"),
     "syncId": os.environ.get("SYNC_ID", ""),
 }, open(os.environ["AZ_SCRIPTS_OUTPUT_PATH"], "w"))
@@ -448,14 +458,14 @@ fi
 @description('Stripe-style local correlation id (dep_<token>) generated during the phone-home. It stays client-side; quote it together with your sync id when talking to Captain support.')
 output deploymentId string = enroll.properties.outputs.deploymentId
 
-@description('The subscribe_url Captain confirmed for this sync: the per-sync ingest URL the Event Grid subscription delivers to.')
-output subscribeUrl string = enroll.properties.outputs.subscribeUrl
+@description('The per-sync ingest URL Captain confirmed during enrollment (the same URL the event subscription delivers to).')
+output ingestUrl string = enroll.properties.outputs.ingestUrl
 
 @description('Whether Captain reports a webhook signing secret is set for this sync (true / false / unknown).')
 output webhookSecretSet string = enroll.properties.outputs.secretSet
 
 @description('Resource id of the cross-tenant read role assignment Captain uses.')
-output readRoleAssignmentId string = readGrant.id
+output readRoleAssignmentId string = empty(captainPrincipalId) ? '' : readGrant.id
 
 @description('Event Grid system topic created on the storage account.')
 output systemTopicName string = systemTopic.name

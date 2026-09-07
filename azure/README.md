@@ -19,13 +19,13 @@ reconcile still catches the change.
 
 ## Deploy to Azure (not yet available)
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fcaptaindeploytemplates.blob.core.windows.net%2Ftemplates%2F2026-08-13%2Fcaptain-blob-sync.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fcaptaindeploytemplates.blob.core.windows.net%2Ftemplates%2F2026-09-07%2Fcaptain-blob-sync.json)
 
 The link, expanded:
 
 ```
 https://portal.azure.com/#create/Microsoft.Template/uri/
-  https%3A%2F%2Fcaptaindeploytemplates.blob.core.windows.net%2Ftemplates%2F2026-08-13%2Fcaptain-blob-sync.json
+  https%3A%2F%2Fcaptaindeploytemplates.blob.core.windows.net%2Ftemplates%2F2026-09-07%2Fcaptain-blob-sync.json
 ```
 
 Captain normally generates this whole link per sync and pre-fills the
@@ -40,22 +40,29 @@ There are two artifacts in this folder:
 - `arm/captain-blob-sync.json` is compiled from it (`az bicep build`) and is what
   the Deploy to Azure button and `az deployment group create` consume.
 
-## Before you deploy: one-time admin consent
+## Auth: account key by default, keyless as an option
 
-The cross-tenant read grant is keyless. Captain reads with a token minted for its
-OWN service principal, and your tenant grants that principal a read role. For the
-role assignment to reference it, Captain's service principal has to EXIST in your
-tenant first. That happens when a tenant admin grants consent to the Captain
-enterprise application once:
+Captain reads your blobs with the storage-account key you provide when the sync
+is created (`POST /v2/collections/{collection}/sync/azure` with `account_name`
++ `account_key`; the key is stored in Captain's secret store and can be rotated
+later with `PATCH /v2/syncs/{sync_id}`). This template then only wires EVENTS:
+the Event Grid system topic, the event subscription to Captain's ingest URL,
+and the self-verifying phone-home. Leave `captainPrincipalId` empty and no role
+assignment is created.
+
+**Optional keyless mode**: if Captain has enabled the cross-tenant Entra grant
+for your workspace, a tenant admin grants consent to the Captain enterprise
+application once:
 
 ```
 https://login.microsoftonline.com/common/adminconsent?client_id=<CaptainAppId>
 ```
 
-Captain gives you this consent link. After consent, Captain reads back the object
-id of its now-present service principal in your tenant and fills it into the
-deploy link as `captainPrincipalId`. No consent means no principal to grant, and
-Captain cannot read your blobs until it is fixed.
+Captain then reads back the object id of its service principal in your tenant
+and fills it into the deploy link as `captainPrincipalId`; the template adds a
+Storage Blob Data Reader role assignment on the storage account and Captain
+reads with its own identity — no keys, no SAS. Ask Captain support about
+availability before using this mode.
 
 ## Prerequisites
 
@@ -82,9 +89,11 @@ The person clicking Deploy needs, on the target resource group:
 - `Microsoft.Resources/deployments/*` (create the deployment).
 - `Microsoft.EventGrid/systemTopics/*` and
   `Microsoft.EventGrid/systemTopics/eventSubscriptions/*` (event wiring).
-- `Microsoft.Authorization/roleAssignments/write` (the read grant). This is the
-  one that trips people up: only **Owner** or **User Access Administrator** can
-  create role assignments. Plain Contributor cannot.
+- `Microsoft.Authorization/roleAssignments/write` — ONLY when deploying keyless
+  mode (`captainPrincipalId` set). This is the one that trips people up: only
+  **Owner** or **User Access Administrator** can create role assignments; plain
+  Contributor cannot. Account-key deploys (the default) skip the role
+  assignment and Contributor is enough.
 - `Microsoft.Resources/deploymentScripts/*`, plus the ability to create the
   script's backing resources (`Microsoft.Storage/storageAccounts/*`,
   `Microsoft.ContainerInstance/containerGroups/*`).
@@ -159,6 +168,26 @@ deploy time.
   contact Captain support with your `syncId` and the `deploymentId` output
   (`dep_<token>`, a client-side correlation id from the phone-home logs).
 
+- **A redeploy did not re-run the phone-home.** It did: `deployTimestamp`
+  (default `utcNow()`) is wired to the script's `forceUpdateTag`, so every
+  deployment re-executes the enrollment verification. If you overrode
+  `deployTimestamp` with a fixed value, ARM will skip the script when nothing
+  else changed.
+
+- **deploymentScripts infrastructure failures (look like Captain errors but are
+  not).** The script runs in a transient storage account + container instance
+  in YOUR resource group. Enterprise policy commonly breaks this: a policy
+  denying storage accounts with shared-key access (the transient account
+  requires it), an allowed-locations policy excluding the region, or ACI
+  capacity in the region. The error names `Microsoft.ContainerInstance` or a
+  policy assignment rather than anything Captain.
+
+- **System topic conflict.** Azure allows exactly ONE Event Grid system topic
+  per storage account. If the account already has one (Functions and Logic
+  Apps often create them), the topic create fails with a conflict — delete the
+  duplicate topic, or wire the subscription onto the existing topic with the
+  az CLI instead of this template.
+
 - **Common causes:**
   - HTTP 401/403 from the phone-home: `captainApiKey` is wrong, revoked, or
     belongs to a different Captain workspace than the sync.
@@ -189,8 +218,7 @@ az deployment group validate \
       location=<accountRegion> \
       captainEventWebhookUrl='<subscribe_url Captain minted for this sync>' \
       captainApiKey='<your Captain API key>' \
-      captainPrincipalId=<captain-sp-object-id> \
-      syncId=sync_...
+      syncId=sync_...  # captainPrincipalId only for keyless mode; blobPrefix optional
 # captainApiBase defaults to https://api.captain.dev; override it only for a
 # Captain staging environment.
 
@@ -200,7 +228,7 @@ az deployment group what-if \
   --template-file arm/captain-blob-sync.json \
   --parameters storageAccountName=<existingaccount> location=<accountRegion> \
       captainEventWebhookUrl='...' captainApiKey='...' \
-      captainPrincipalId=<...> syncId=sync_...
+      syncId=sync_...
 
 # 3. Deploy for real. Succeeds only if the handshake passes AND Captain
 #    confirms the webhook enrollment.
@@ -210,7 +238,7 @@ az deployment group create \
   --template-file arm/captain-blob-sync.json \
   --parameters storageAccountName=<existingaccount> location=<accountRegion> \
       captainEventWebhookUrl='...' captainApiKey='...' \
-      captainPrincipalId=<...> syncId=sync_...
+      syncId=sync_...
 
 # 4. Read the phone-home output.
 az deployment group show --resource-group <rg> --name captain-blob-sync \
@@ -236,8 +264,8 @@ and reconcile continues as the backstop until you delete the sync in Captain.
 
 - `deploymentId`: the `dep_<token>` correlation id; quote it with your `syncId`
   to Captain support.
-- `subscribeUrl`: the per-sync ingest URL Captain confirmed during enrollment.
+- `ingestUrl`: the per-sync ingest URL Captain confirmed during enrollment.
 - `webhookSecretSet`: whether Captain reports a webhook signing secret is set.
-- `readRoleAssignmentId`: the cross-tenant read role assignment Captain uses.
+- `readRoleAssignmentId`: the cross-tenant read role assignment (keyless mode only; empty for account-key syncs).
 - `systemTopicName` / `eventSubscriptionName`: the event wiring that was created.
 - `whatToDoNext`: one-line next step.
