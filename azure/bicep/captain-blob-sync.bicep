@@ -160,9 +160,13 @@ resource eventSubscription 'Microsoft.EventGrid/systemTopics/eventSubscriptions@
     destination: {
       endpointType: 'WebHook'
       properties: {
-        // The subscribe_url carries a per-sync routing token but is not a
-        // credential; it is echoed in outputs for the customer's records,
-        // so it is intentionally a plain (non-secure) parameter.
+        // HONESTY (adversarial review 2026-09-07): the ingest URL EMBEDS the
+        // webhook secret — it IS the bearer credential for this sync's event
+        // stream. It stays a plain parameter because Event Grid must store it
+        // in the subscription anyway and the exposure audience is this
+        // resource group's readers; if it leaks, rotate with
+        // POST /v2/syncs/{id}/webhooks {"rotate_secret": true} and update the
+        // subscription endpoint (which re-runs the handshake).
         #disable-next-line use-secure-value-for-secure-inputs
         endpointUrl: captainEventWebhookUrl
         // One event per POST keeps Captain's ingest handler simple; raise later
@@ -274,6 +278,12 @@ echo "------------------------------------------------------------------"
 case "${CAPTAIN_API_BASE}" in
   https://*) echo "preflight: Captain API base is https, ok" ;;
   *) echo "PREFLIGHT FAILED: captainApiBase must be https:// (refusing to send the Captain API key in the clear). Got: ${CAPTAIN_API_BASE}"; exit 1 ;;
+esac
+# The API key is sent as a Bearer header to this base: pin it to Captain-owned
+# domains so a crafted deploy link cannot exfiltrate the key to a third party.
+case "${CAPTAIN_API_BASE}" in
+  https://api.captain.dev|https://*.captain.dev|https://api.runcaptain.com|https://*.runcaptain.com) : ;;
+  *) echo "PREFLIGHT FAILED: captainApiBase must be a captain.dev / runcaptain.com domain (got: ${CAPTAIN_API_BASE}). This guard keeps your Captain API key from being sent elsewhere."; exit 1 ;;
 esac
 case "${EVENT_WEBHOOK_URL}" in
   https://*) echo "preflight: event webhook is https, ok" ;;

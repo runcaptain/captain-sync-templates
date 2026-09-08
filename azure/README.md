@@ -252,6 +252,24 @@ Deploying from Bicep directly works too (`--template-file bicep/captain-blob-syn
 the CLI compiles it on the fly. The committed `arm/captain-blob-sync.json` exists
 so the portal button and environments without the Bicep CLI can deploy.
 
+## If the ingest URL leaks
+
+The ingest URL embeds the webhook secret that authenticates this sync's event
+stream (readable by anyone with read access to the resource group's deployment
+history). Rotate it:
+
+```bash
+curl -s -X POST "$CAPTAIN_API_BASE/v2/syncs/$SYNC_ID/webhooks" \
+  -H "Authorization: Bearer $CAPTAIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"rotate_secret": true}'
+# then point the event subscription at the new ingest_url (re-runs the handshake):
+az eventgrid system-topic event-subscription update \
+  -g <rg> --system-topic-name <topic> -n <subscription> --endpoint "<new ingest_url>"
+```
+
+The old URL stops resolving immediately; reconcile backstops anything missed
+during the swap.
+
 ## Teardown
 
 Delete the resource group, or delete these resources: the deployment script, the
